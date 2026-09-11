@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -29,6 +30,7 @@ from aiogram.types import (
     Message,
     Update,
 )
+
 from dotenv import load_dotenv
 
 
@@ -42,21 +44,24 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
-DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
 
-# Render public URL
+DATA_FILE = Path(
+    os.getenv("DATA_FILE", "data.json")
+)
+
 RENDER_URL = os.getenv(
     "RENDER_URL",
     "https://paid-rczj.onrender.com",
 ).strip().rstrip("/")
 
-# Optional Telegram webhook secret
 WEBHOOK_SECRET = os.getenv(
     "WEBHOOK_SECRET",
-    "latest-channel-copy-secret",
+    "change-this-secret",
 ).strip()
 
-WEBHOOK_PATH = f"/telegram/webhook/{WEBHOOK_SECRET}"
+WEBHOOK_PATH = (
+    f"/telegram/webhook/{WEBHOOK_SECRET}"
+)
 
 
 if not BOT_TOKEN:
@@ -64,12 +69,16 @@ if not BOT_TOKEN:
         "BOT_TOKEN is missing."
     )
 
+
 if not ADMIN_ID_RAW.isdigit():
     raise RuntimeError(
         "ADMIN_ID must be numeric."
     )
 
-ADMIN_ID = int(ADMIN_ID_RAW)
+
+ADMIN_ID = int(
+    ADMIN_ID_RAW
+)
 
 
 # ============================================================
@@ -87,20 +96,27 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(
-    "latest-channel-copy"
+    "route-channel-copy"
 )
 
 
 # ============================================================
-# SETTINGS
+# DEFAULT SETTINGS
 # ============================================================
 
 DEFAULT_SETTINGS = {
-    "interval": 2.0,
-    "max_queue": 5000,
+    # Delay between destination copies.
+    "interval": 1.0,
+
+    # Retry count for temporary/network errors.
     "retries": 5,
+
+    # Time to wait for all album messages.
     "album_wait": 1.5,
-    "skip_failed": True,
+
+    # Maximum pending posts per source route.
+    "max_queue": 10000,
+
     "enabled": True,
 }
 
@@ -110,6 +126,7 @@ DEFAULT_SETTINGS = {
 # ============================================================
 
 def default_db() -> dict[str, Any]:
+
     return {
         "settings": DEFAULT_SETTINGS.copy(),
 
@@ -117,13 +134,23 @@ def default_db() -> dict[str, Any]:
 
         "destinations": [],
 
+        # IMPORTANT:
+        #
+        # source_id:
+        # {
+        #   "source": {...},
+        #   "destinations": [...]
+        # }
+        #
+        "routes": {},
+
         "stats": {
             "received": 0,
             "queued": 0,
             "sent": 0,
             "failed": 0,
-            "skipped": 0,
             "albums": 0,
+
             "last_received": None,
             "last_sent": None,
             "last_error": None,
@@ -136,6 +163,7 @@ def default_db() -> dict[str, Any]:
 def load_db() -> dict[str, Any]:
 
     if not DATA_FILE.exists():
+
         return default_db()
 
     try:
@@ -149,48 +177,124 @@ def load_db() -> dict[str, Any]:
     except Exception:
 
         log.exception(
-            "Failed to read data file."
+            "Could not read data.json"
         )
 
         return default_db()
 
     fresh = default_db()
 
+    # --------------------------------------------------------
+    # SETTINGS
+    # --------------------------------------------------------
+
     if isinstance(
         data.get("settings"),
         dict,
     ):
+
         fresh["settings"].update(
             data["settings"]
         )
+
+    # --------------------------------------------------------
+    # SOURCES
+    # --------------------------------------------------------
 
     if isinstance(
         data.get("sources"),
         list,
     ):
-        fresh["sources"] = data["sources"]
+
+        fresh["sources"] = data[
+            "sources"
+        ]
+
+    # --------------------------------------------------------
+    # DESTINATIONS
+    # --------------------------------------------------------
 
     if isinstance(
         data.get("destinations"),
         list,
     ):
+
         fresh["destinations"] = data[
             "destinations"
         ]
+
+    # --------------------------------------------------------
+    # ROUTES
+    # --------------------------------------------------------
+
+    if isinstance(
+        data.get("routes"),
+        dict,
+    ):
+
+        fresh["routes"] = data[
+            "routes"
+        ]
+
+    # --------------------------------------------------------
+    # OLD DATABASE MIGRATION
+    # --------------------------------------------------------
+
+    else:
+
+        # Old version had all sources and all destinations
+        # globally connected.
+        #
+        # Convert that into:
+        #
+        # Every old source -> every old destination.
+        #
+
+        if (
+            fresh["sources"]
+            and fresh["destinations"]
+        ):
+
+            for source in fresh[
+                "sources"
+            ]:
+
+                sid = str(
+                    source["id"]
+                )
+
+                fresh["routes"][sid] = {
+                    "source": source,
+                    "destinations": list(
+                        fresh["destinations"]
+                    ),
+                }
+
+    # --------------------------------------------------------
+    # STATS
+    # --------------------------------------------------------
 
     if isinstance(
         data.get("stats"),
         dict,
     ):
+
         fresh["stats"].update(
             data["stats"]
         )
+
+    # --------------------------------------------------------
+    # SEEN
+    # --------------------------------------------------------
 
     if isinstance(
         data.get("seen"),
         dict,
     ):
-        fresh["seen"] = data["seen"]
+
+        fresh["seen"] = data[
+            "seen"
+        ]
 
     return fresh
 
@@ -209,11 +313,13 @@ async def save_db():
             exist_ok=True,
         )
 
-        temp = DATA_FILE.with_suffix(
-            ".tmp"
+        temporary_file = (
+            DATA_FILE.with_suffix(
+                ".tmp"
+            )
         )
 
-        temp.write_text(
+        temporary_file.write_text(
             json.dumps(
                 db,
                 ensure_ascii=False,
@@ -222,7 +328,7 @@ async def save_db():
             encoding="utf-8",
         )
 
-        temp.replace(
+        temporary_file.replace(
             DATA_FILE
         )
 
@@ -235,27 +341,54 @@ router = Router()
 
 bot: Bot | None = None
 
-server_runner: web.AppRunner | None = None
+dp: Dispatcher | None = None
 
-destination_queues: dict[
+server_runner: (
+    web.AppRunner | None
+) = None
+
+
+# ============================================================
+# ROUTE QUEUES
+# ============================================================
+
+#
+# ONE QUEUE PER SOURCE
+#
+# Source 1 -> Queue 1 -> Worker 1
+# Source 2 -> Queue 2 -> Worker 2
+# Source 3 -> Queue 3 -> Worker 3
+#
+# This is the important fix.
+#
+
+route_queues: dict[
     str,
     asyncio.Queue,
 ] = {}
 
-destination_tasks: dict[
+
+route_tasks: dict[
     str,
     asyncio.Task,
 ] = {}
+
+
+# ============================================================
+# ALBUM RUNTIME
+# ============================================================
 
 album_tasks: dict[
     tuple[str, str],
     asyncio.Task,
 ] = {}
 
+
 album_buffer: dict[
     tuple[str, str],
     list[int],
 ] = defaultdict(list)
+
 
 seen_lock = asyncio.Lock()
 
@@ -265,26 +398,32 @@ seen_lock = asyncio.Lock()
 # ============================================================
 
 class AddSource(StatesGroup):
+
     value = State()
 
 
 class AddDestination(StatesGroup):
+
     value = State()
 
 
 class SetInterval(StatesGroup):
-    value = State()
 
-
-class SetQueue(StatesGroup):
     value = State()
 
 
 class SetRetries(StatesGroup):
+
     value = State()
 
 
 class SetAlbumWait(StatesGroup):
+
+    value = State()
+
+
+class SetQueue(StatesGroup):
+
     value = State()
 
 
@@ -296,16 +435,14 @@ def is_admin(
     obj: Message | CallbackQuery,
 ) -> bool:
 
-    user = obj.from_user
-
     return bool(
-        user
-        and user.id == ADMIN_ID
+        obj.from_user
+        and obj.from_user.id == ADMIN_ID
     )
 
 
 # ============================================================
-# HELPERS
+# DATABASE HELPERS
 # ============================================================
 
 def source_ids() -> set[str]:
@@ -324,6 +461,48 @@ def destination_ids() -> set[str]:
     }
 
 
+def get_source(
+    source_id: str,
+) -> dict[str, Any] | None:
+
+    source_id = str(
+        source_id
+    )
+
+    for source in db[
+        "sources"
+    ]:
+
+        if str(
+            source["id"]
+        ) == source_id:
+
+            return source
+
+    return None
+
+
+def get_destination(
+    destination_id: str,
+) -> dict[str, Any] | None:
+
+    destination_id = str(
+        destination_id
+    )
+
+    for destination in db[
+        "destinations"
+    ]:
+
+        if str(
+            destination["id"]
+        ) == destination_id:
+
+            return destination
+
+    return None
+
+
 def display_name(
     item: dict[str, Any],
 ) -> str:
@@ -331,14 +510,87 @@ def display_name(
     return (
         item.get("title")
         or item.get("username")
-        or str(item.get("id", "Unknown"))
+        or str(
+            item.get(
+                "id",
+                "Unknown",
+            )
+        )
     )
 
 
+def route_destinations(
+    source_id: str,
+) -> list[dict[str, Any]]:
+
+    route = db[
+        "routes"
+    ].get(
+        str(source_id),
+        {},
+    )
+
+    destinations = route.get(
+        "destinations",
+        [],
+    )
+
+    if not isinstance(
+        destinations,
+        list,
+    ):
+
+        return []
+
+    return destinations
+
+
+def route_destination_ids(
+    source_id: str,
+) -> set[str]:
+
+    return {
+        str(item["id"])
+        for item in route_destinations(
+            source_id
+        )
+    }
+
+
+def route_count() -> int:
+
+    count = 0
+
+    for source in db[
+        "sources"
+    ]:
+
+        sid = str(
+            source["id"]
+        )
+
+        if route_destinations(
+            sid
+        ):
+
+            count += 1
+
+    return count
+
+
+# ============================================================
+# HOME
+# ============================================================
+
 def home_text() -> str:
 
-    settings = db["settings"]
-    stats = db["stats"]
+    settings = db[
+        "settings"
+    ]
+
+    stats = db[
+        "stats"
+    ]
 
     status = (
         "🟢 RUNNING"
@@ -347,11 +599,13 @@ def home_text() -> str:
     )
 
     return (
-        "🤖 <b>Latest Channel Copy Bot</b>\n\n"
+        "🤖 <b>Route Channel Copy Bot</b>\n\n"
 
         f"Status: <b>{status}</b>\n"
         f"Sources: <b>{len(db['sources'])}</b>\n"
-        f"Destinations: <b>{len(db['destinations'])}</b>\n\n"
+        f"Destinations: "
+        f"<b>{len(db['destinations'])}</b>\n"
+        f"Routes: <b>{route_count()}</b>\n\n"
 
         f"⏱ Interval: "
         f"<b>{settings['interval']}s</b>\n"
@@ -360,7 +614,10 @@ def home_text() -> str:
         f"<b>{settings['album_wait']}s</b>\n"
 
         f"🔁 Retries: "
-        f"<b>{settings['retries']}</b>\n\n"
+        f"<b>{settings['retries']}</b>\n"
+
+        f"📚 Queue: "
+        f"<b>{settings['max_queue']}</b>\n\n"
 
         f"📥 Received: "
         f"<b>{stats['received']}</b>\n"
@@ -372,10 +629,7 @@ def home_text() -> str:
         f"<b>{stats['sent']}</b>\n"
 
         f"❌ Failed: "
-        f"<b>{stats['failed']}</b>\n"
-
-        f"⏭ Skipped: "
-        f"<b>{stats['skipped']}</b>"
+        f"<b>{stats['failed']}</b>"
     )
 
 
@@ -385,7 +639,9 @@ def home_text() -> str:
 
 def home_keyboard():
 
-    enabled = db["settings"]["enabled"]
+    enabled = db[
+        "settings"
+    ]["enabled"]
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -403,9 +659,10 @@ def home_keyboard():
 
             [
                 InlineKeyboardButton(
-                    text="📥 Sources",
+                    text="🔀 Routes",
                     callback_data="sources",
                 ),
+
                 InlineKeyboardButton(
                     text="📤 Destinations",
                     callback_data="destinations",
@@ -417,6 +674,7 @@ def home_keyboard():
                     text="⚙️ Settings",
                     callback_data="settings",
                 ),
+
                 InlineKeyboardButton(
                     text="📊 Status",
                     callback_data="status",
@@ -437,19 +695,30 @@ def sources_keyboard():
 
     rows = []
 
-    for index, item in enumerate(
+    for index, source in enumerate(
         db["sources"]
     ):
+
+        sid = str(
+            source["id"]
+        )
+
+        count = len(
+            route_destinations(
+                sid
+            )
+        )
 
         rows.append(
             [
                 InlineKeyboardButton(
                     text=(
-                        "❌ "
-                        + display_name(item)
+                        f"🔀 "
+                        f"{display_name(source)} "
+                        f"[{count}]"
                     ),
                     callback_data=(
-                        f"delete_source:{index}"
+                        f"route:{index}"
                     ),
                 )
             ]
@@ -478,23 +747,120 @@ def sources_keyboard():
     )
 
 
-def destinations_keyboard():
+def route_keyboard(
+    source_id: str,
+):
+
+    selected = route_destination_ids(
+        source_id
+    )
 
     rows = []
 
-    for index, item in enumerate(
+    for index, destination in enumerate(
         db["destinations"]
     ):
+
+        did = str(
+            destination["id"]
+        )
+
+        mark = (
+            "✅"
+            if did in selected
+            else "⬜"
+        )
 
         rows.append(
             [
                 InlineKeyboardButton(
                     text=(
-                        "❌ "
-                        + display_name(item)
+                        f"{mark} "
+                        f"{display_name(destination)}"
                     ),
                     callback_data=(
-                        f"delete_destination:{index}"
+                        f"route_dest:"
+                        f"{source_id}:"
+                        f"{index}"
+                    ),
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="➕ Add Destination",
+                callback_data=(
+                    f"new_dest_for:"
+                    f"{source_id}"
+                ),
+            )
+        ]
+    )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="❌ Remove Source",
+                callback_data=(
+                    f"remove_source:"
+                    f"{source_id}"
+                ),
+            )
+        ]
+    )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Routes",
+                callback_data="sources",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def destinations_keyboard():
+
+    rows = []
+
+    for index, destination in enumerate(
+        db["destinations"]
+    ):
+
+        did = str(
+            destination["id"]
+        )
+
+        used_by = sum(
+            1
+            for source in db[
+                "sources"
+            ]
+            if did
+            in route_destination_ids(
+                str(
+                    source["id"]
+                )
+            )
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"❌ "
+                        f"{display_name(destination)} "
+                        f"[{used_by} routes]"
+                    ),
+                    callback_data=(
+                        f"delete_destination:"
+                        f"{index}"
                     ),
                 )
             ]
@@ -525,7 +891,9 @@ def destinations_keyboard():
 
 def settings_keyboard():
 
-    s = db["settings"]
+    settings = db[
+        "settings"
+    ]
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -534,9 +902,11 @@ def settings_keyboard():
                 InlineKeyboardButton(
                     text=(
                         f"⏱ Interval: "
-                        f"{s['interval']}s"
+                        f"{settings['interval']}s"
                     ),
-                    callback_data="setting:interval",
+                    callback_data=(
+                        "setting:interval"
+                    ),
                 )
             ],
 
@@ -544,9 +914,11 @@ def settings_keyboard():
                 InlineKeyboardButton(
                     text=(
                         f"📦 Album wait: "
-                        f"{s['album_wait']}s"
+                        f"{settings['album_wait']}s"
                     ),
-                    callback_data="setting:album",
+                    callback_data=(
+                        "setting:album"
+                    ),
                 )
             ],
 
@@ -554,9 +926,11 @@ def settings_keyboard():
                 InlineKeyboardButton(
                     text=(
                         f"🔁 Retries: "
-                        f"{s['retries']}"
+                        f"{settings['retries']}"
                     ),
-                    callback_data="setting:retries",
+                    callback_data=(
+                        "setting:retries"
+                    ),
                 )
             ],
 
@@ -564,23 +938,11 @@ def settings_keyboard():
                 InlineKeyboardButton(
                     text=(
                         f"📚 Queue: "
-                        f"{s['max_queue']}"
+                        f"{settings['max_queue']}"
                     ),
-                    callback_data="setting:queue",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=(
-                        "⏭ Skip failed: "
-                        + (
-                            "ON"
-                            if s["skip_failed"]
-                            else "OFF"
-                        )
+                    callback_data=(
+                        "setting:queue"
                     ),
-                    callback_data="setting:skip",
                 )
             ],
 
@@ -595,7 +957,7 @@ def settings_keyboard():
 
 
 # ============================================================
-# CHAT RESOLUTION + PERMISSION CHECK
+# TELEGRAM CHAT RESOLUTION
 # ============================================================
 
 async def resolve_chat(
@@ -603,6 +965,7 @@ async def resolve_chat(
 ) -> dict[str, str]:
 
     if bot is None:
+
         raise RuntimeError(
             "Bot is not initialized."
         )
@@ -610,6 +973,7 @@ async def resolve_chat(
     value = value.strip()
 
     if not value:
+
         raise ValueError(
             "Channel username or ID is empty."
         )
@@ -621,7 +985,7 @@ async def resolve_chat(
     if chat.type != ChatType.CHANNEL:
 
         raise ValueError(
-            "This is not a Telegram channel."
+            "Only Telegram channels are supported."
         )
 
     member = await bot.get_chat_member(
@@ -639,21 +1003,21 @@ async def resolve_chat(
             "in this channel."
         )
 
-    title = (
-        chat.title
-        or chat.username
-        or str(chat.id)
-    )
-
-    username = (
-        chat.username
-        or ""
-    )
-
     return {
-        "id": str(chat.id),
-        "title": title,
-        "username": username,
+        "id": str(
+            chat.id
+        ),
+
+        "title": (
+            chat.title
+            or chat.username
+            or str(chat.id)
+        ),
+
+        "username": (
+            chat.username
+            or ""
+        ),
     }
 
 
@@ -676,34 +1040,37 @@ async def verify_destination(
 
         raise PermissionError(
             "Bot is not administrator "
-            "in destination channel."
+            "in destination."
         )
 
     if (
         member.status
         == ChatMemberStatus.ADMINISTRATOR
+        and not member.can_post_messages
     ):
 
-        if not member.can_post_messages:
-
-            raise PermissionError(
-                "Bot does not have "
-                "'Post Messages' permission."
-            )
+        raise PermissionError(
+            "Bot needs Post Messages "
+            "permission."
+        )
 
 
 # ============================================================
-# QUEUES
+# ROUTE WORKERS
 # ============================================================
 
-def get_queue(
-    destination_id: str,
-) -> asyncio.Queue:
+async def start_route_worker(
+    source_id: str,
+):
 
-    if destination_id not in destination_queues:
+    source_id = str(
+        source_id
+    )
 
-        destination_queues[
-            destination_id
+    if source_id not in route_queues:
+
+        route_queues[
+            source_id
         ] = asyncio.Queue(
             maxsize=int(
                 db["settings"][
@@ -712,77 +1079,100 @@ def get_queue(
             )
         )
 
-    return destination_queues[
-        destination_id
-    ]
-
-
-async def start_worker(
-    destination_id: str,
-):
-
-    task = destination_tasks.get(
-        destination_id
+    existing_task = route_tasks.get(
+        source_id
     )
 
-    if task and not task.done():
+    if (
+        existing_task
+        and not existing_task.done()
+    ):
+
         return
 
-    destination_tasks[
-        destination_id
+    route_tasks[
+        source_id
     ] = asyncio.create_task(
-        destination_worker(
-            destination_id
+        route_worker(
+            source_id
         )
     )
 
 
-async def stop_worker(
-    destination_id: str,
+async def stop_route_worker(
+    source_id: str,
 ):
 
-    task = destination_tasks.pop(
-        destination_id,
+    source_id = str(
+        source_id
+    )
+
+    task = route_tasks.pop(
+        source_id,
         None,
     )
 
-    if not task:
-        return
+    if task:
 
-    task.cancel()
+        task.cancel()
 
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+        try:
+
+            await task
+
+        except asyncio.CancelledError:
+
+            pass
+
+    route_queues.pop(
+        source_id,
+        None,
+    )
 
 
-async def ensure_workers():
+async def ensure_route_workers():
 
     if not db["settings"]["enabled"]:
+
         return
 
-    wanted = destination_ids()
+    wanted = set()
 
-    for destination_id in wanted:
+    for source in db[
+        "sources"
+    ]:
 
-        await start_worker(
-            destination_id
+        sid = str(
+            source["id"]
         )
 
-    for destination_id in list(
-        destination_tasks
+        if route_destinations(
+            sid
+        ):
+
+            wanted.add(
+                sid
+            )
+
+    for sid in wanted:
+
+        await start_route_worker(
+            sid
+        )
+
+    for sid in list(
+        route_tasks
     ):
 
-        if destination_id not in wanted:
+        if sid not in wanted:
 
-            await stop_worker(
-                destination_id
+            await stop_route_worker(
+                sid
             )
 
 
 # ============================================================
-# COPY SINGLE
+# COPY SINGLE MESSAGE
 # ============================================================
 
 async def copy_single(
@@ -792,10 +1182,13 @@ async def copy_single(
 ) -> bool:
 
     if bot is None:
+
         return False
 
     retries = int(
-        db["settings"]["retries"]
+        db["settings"][
+            "retries"
+        ]
     )
 
     for attempt in range(
@@ -805,7 +1198,10 @@ async def copy_single(
         try:
 
             log.info(
-                "COPY source=%s destination=%s message=%s",
+                "COPY "
+                "source=%s "
+                "destination=%s "
+                "message=%s",
                 source_id,
                 destination_id,
                 message_id,
@@ -818,11 +1214,16 @@ async def copy_single(
                 from_chat_id=int(
                     source_id
                 ),
-                message_id=message_id,
+                message_id=int(
+                    message_id
+                ),
             )
 
             log.info(
-                "COPY SUCCESS source=%s destination=%s message=%s",
+                "COPY SUCCESS "
+                "source=%s "
+                "destination=%s "
+                "message=%s",
                 source_id,
                 destination_id,
                 message_id,
@@ -833,13 +1234,19 @@ async def copy_single(
         except TelegramRetryAfter as exc:
 
             wait = (
-                int(exc.retry_after)
+                int(
+                    exc.retry_after
+                )
                 + 1
             )
 
             log.warning(
-                "FloodWait: %ss",
+                "FloodWait %ss "
+                "source=%s "
+                "destination=%s",
                 wait,
+                source_id,
+                destination_id,
             )
 
             await asyncio.sleep(
@@ -848,34 +1255,36 @@ async def copy_single(
 
         except TelegramForbiddenError as exc:
 
-            error = str(exc)
-
             db["stats"][
                 "last_error"
-            ] = error
+            ] = str(exc)
 
             log.error(
-                "FORBIDDEN destination=%s: %s",
+                "Forbidden "
+                "source=%s "
+                "destination=%s: %s",
+                source_id,
                 destination_id,
-                error,
+                exc,
             )
 
             return False
 
         except TelegramBadRequest as exc:
 
-            error = str(exc)
-
             db["stats"][
                 "last_error"
-            ] = error
+            ] = str(exc)
 
             log.error(
-                "BAD REQUEST source=%s destination=%s message=%s: %s",
+                "Bad request "
+                "source=%s "
+                "destination=%s "
+                "message=%s: %s",
                 source_id,
                 destination_id,
                 message_id,
-                error,
+                exc,
             )
 
             return False
@@ -889,16 +1298,19 @@ async def copy_single(
                 ] = str(exc)
 
                 log.error(
-                    "Network error after retries."
+                    "Network error after retries: %s",
+                    exc,
                 )
 
                 return False
 
+            wait = min(
+                2 ** attempt,
+                30,
+            )
+
             await asyncio.sleep(
-                min(
-                    2 ** attempt,
-                    30,
-                )
+                wait
             )
 
         except Exception as exc:
@@ -933,149 +1345,53 @@ async def copy_album(
     source_id: str,
     destination_id: str,
     message_ids: list[int],
-) -> bool:
+) -> int:
 
-    if bot is None:
-        return False
+    sent = 0
 
-    retries = int(
-        db["settings"]["retries"]
-    )
+    for message_id in message_ids:
 
-    for attempt in range(
-        retries + 1
-    ):
+        success = await copy_single(
+            source_id,
+            destination_id,
+            message_id,
+        )
 
-        try:
+        if success:
 
-            log.info(
-                "COPY ALBUM source=%s destination=%s messages=%s",
-                source_id,
-                destination_id,
-                message_ids,
+            sent += 1
+
+        await asyncio.sleep(
+            float(
+                db["settings"][
+                    "interval"
+                ]
             )
+        )
 
-            await bot.copy_messages(
-                chat_id=int(
-                    destination_id
-                ),
-                from_chat_id=int(
-                    source_id
-                ),
-                message_ids=message_ids,
-            )
-
-            log.info(
-                "ALBUM SUCCESS source=%s destination=%s",
-                source_id,
-                destination_id,
-            )
-
-            return True
-
-        except TelegramRetryAfter as exc:
-
-            await asyncio.sleep(
-                int(
-                    exc.retry_after
-                ) + 1
-            )
-
-        except TelegramBadRequest as exc:
-
-            log.warning(
-                "Bulk album copy failed: %s",
-                exc,
-            )
-
-            # Fallback to individual copies.
-            success = True
-
-            for message_id in message_ids:
-
-                ok = await copy_single(
-                    source_id,
-                    destination_id,
-                    message_id,
-                )
-
-                if not ok:
-                    success = False
-
-                await asyncio.sleep(
-                    float(
-                        db["settings"][
-                            "interval"
-                        ]
-                    )
-                )
-
-            return success
-
-        except TelegramForbiddenError as exc:
-
-            db["stats"][
-                "last_error"
-            ] = str(exc)
-
-            log.error(
-                "Album destination forbidden: %s",
-                exc,
-            )
-
-            return False
-
-        except TelegramNetworkError:
-
-            if attempt >= retries:
-                return False
-
-            await asyncio.sleep(
-                min(
-                    2 ** attempt,
-                    30,
-                )
-            )
-
-        except Exception as exc:
-
-            if attempt >= retries:
-
-                db["stats"][
-                    "last_error"
-                ] = str(exc)
-
-                log.exception(
-                    "Album copy failed."
-                )
-
-                return False
-
-            await asyncio.sleep(
-                min(
-                    2 ** attempt,
-                    30,
-                )
-            )
-
-    return False
+    return sent
 
 
 # ============================================================
-# DESTINATION WORKER
+# ROUTE WORKER
 # ============================================================
 
-async def destination_worker(
-    destination_id: str,
+async def route_worker(
+    source_id: str,
 ):
 
-    queue = get_queue(
-        destination_id
+    source_id = str(
+        source_id
     )
 
+    queue = route_queues[
+        source_id
+    ]
+
     log.info(
-        "Worker started destination=%s",
-        destination_id,
+        "ROUTE WORKER STARTED "
+        "source=%s",
+        source_id,
     )
 
     while True:
@@ -1084,12 +1400,27 @@ async def destination_worker(
 
         try:
 
-            if not db["settings"]["enabled"]:
+            if not db["settings"][
+                "enabled"
+            ]:
+
                 continue
 
-            source_id = item[
-                "source_id"
-            ]
+            destinations = list(
+                route_destinations(
+                    source_id
+                )
+            )
+
+            if not destinations:
+
+                log.warning(
+                    "No destinations "
+                    "for source=%s",
+                    source_id,
+                )
+
+                continue
 
             message_ids = item[
                 "message_ids"
@@ -1099,29 +1430,109 @@ async def destination_worker(
                 "is_album"
             ]
 
-            if is_album:
+            #
+            # IMPORTANT:
+            #
+            # Every destination is attempted
+            # independently.
+            #
+            # If A fails, B/C/D still get
+            # their copy attempt.
+            #
 
-                ok = await copy_album(
-                    source_id,
-                    destination_id,
-                    message_ids,
+            total_sent = 0
+
+            for destination in destinations:
+
+                destination_id = str(
+                    destination["id"]
                 )
 
-            else:
+                try:
 
-                ok = await copy_single(
-                    source_id,
-                    destination_id,
-                    message_ids[0],
+                    if is_album:
+
+                        sent = await copy_album(
+                            source_id,
+                            destination_id,
+                            message_ids,
+                        )
+
+                        total_sent += sent
+
+                        if sent < len(
+                            message_ids
+                        ):
+
+                            db["stats"][
+                                "failed"
+                            ] += (
+                                len(
+                                    message_ids
+                                )
+                                - sent
+                            )
+
+                    else:
+
+                        success = await copy_single(
+                            source_id,
+                            destination_id,
+                            message_ids[0],
+                        )
+
+                        if success:
+
+                            total_sent += 1
+
+                        else:
+
+                            db["stats"][
+                                "failed"
+                            ] += 1
+
+                except Exception as exc:
+
+                    #
+                    # VERY IMPORTANT:
+                    #
+                    # A single destination
+                    # must NEVER kill the
+                    # route worker.
+                    #
+
+                    db["stats"][
+                        "last_error"
+                    ] = str(exc)
+
+                    db["stats"][
+                        "failed"
+                    ] += len(
+                        message_ids
+                    )
+
+                    log.exception(
+                        "Destination failed "
+                        "but route continues. "
+                        "source=%s "
+                        "destination=%s",
+                        source_id,
+                        destination_id,
+                    )
+
+                await asyncio.sleep(
+                    float(
+                        db["settings"][
+                            "interval"
+                        ]
+                    )
                 )
 
-            if ok:
+            db["stats"][
+                "sent"
+            ] += total_sent
 
-                db["stats"][
-                    "sent"
-                ] += len(
-                    message_ids
-                )
+            if total_sent:
 
                 db["stats"][
                     "last_sent"
@@ -1129,33 +1540,7 @@ async def destination_worker(
                     time.time()
                 )
 
-            else:
-
-                db["stats"][
-                    "failed"
-                ] += len(
-                    message_ids
-                )
-
-                if db["settings"][
-                    "skip_failed"
-                ]:
-
-                    db["stats"][
-                        "skipped"
-                    ] += len(
-                        message_ids
-                    )
-
             await save_db()
-
-            await asyncio.sleep(
-                float(
-                    db["settings"][
-                        "interval"
-                    ]
-                )
-            )
 
         except asyncio.CancelledError:
 
@@ -1163,16 +1548,25 @@ async def destination_worker(
 
         except Exception as exc:
 
-            log.exception(
-                "Worker error: %s",
-                exc,
-            )
+            #
+            # Worker itself crashed:
+            # log it, sleep, then CONTINUE.
+            #
 
             db["stats"][
                 "last_error"
             ] = str(exc)
 
-            await asyncio.sleep(2)
+            log.exception(
+                "ROUTE WORKER ERROR "
+                "source=%s. "
+                "Worker continues.",
+                source_id,
+            )
+
+            await asyncio.sleep(
+                2
+            )
 
         finally:
 
@@ -1180,94 +1574,109 @@ async def destination_worker(
 
 
 # ============================================================
-# QUEUE FOR DESTINATIONS
+# QUEUE NEW POST
 # ============================================================
 
-async def queue_for_destinations(
+async def queue_route(
     source_id: str,
     message_ids: list[int],
     is_album: bool,
 ):
 
-    if not db["settings"]["enabled"]:
+    source_id = str(
+        source_id
+    )
+
+    destinations = route_destinations(
+        source_id
+    )
+
+    if not destinations:
+
+        log.warning(
+            "No route destinations "
+            "source=%s",
+            source_id,
+        )
+
         return
 
-    for destination in list(
-        db["destinations"]
-    ):
+    await start_route_worker(
+        source_id
+    )
 
-        destination_id = str(
-            destination["id"]
+    queue = route_queues[
+        source_id
+    ]
+
+    item = {
+        "source_id": source_id,
+
+        "message_ids": [
+            int(message_id)
+            for message_id in message_ids
+        ],
+
+        "is_album": bool(
+            is_album
+        ),
+
+        "created_at": int(
+            time.time()
+        ),
+    }
+
+    try:
+
+        queue.put_nowait(
+            item
         )
 
-        await start_worker(
-            destination_id
+        db["stats"][
+            "queued"
+        ] += len(
+            message_ids
         )
 
-        queue = get_queue(
-            destination_id
+        log.info(
+            "QUEUED "
+            "source=%s "
+            "messages=%s "
+            "destinations=%s",
+            source_id,
+            message_ids,
+            len(
+                destinations
+            ),
         )
 
-        item = {
-            "source_id": str(
-                source_id
-            ),
-            "message_ids": [
-                int(x)
-                for x in message_ids
-            ],
-            "is_album": bool(
-                is_album
-            ),
-            "created_at": int(
-                time.time()
-            ),
-        }
+        await save_db()
 
-        try:
+    except asyncio.QueueFull:
 
-            queue.put_nowait(
-                item
-            )
+        db["stats"][
+            "failed"
+        ] += len(
+            message_ids
+        )
 
-            db["stats"][
-                "queued"
-            ] += len(
-                message_ids
-            )
+        db["stats"][
+            "last_error"
+        ] = (
+            "Route queue full "
+            + source_id
+        )
 
-            log.info(
-                "QUEUED source=%s destination=%s messages=%s",
-                source_id,
-                destination_id,
-                message_ids,
-            )
+        log.error(
+            "QUEUE FULL source=%s",
+            source_id,
+        )
 
-        except asyncio.QueueFull:
-
-            db["stats"][
-                "failed"
-            ] += len(
-                message_ids
-            )
-
-            db["stats"][
-                "last_error"
-            ] = (
-                "Queue full for "
-                + destination_id
-            )
-
-            log.error(
-                "Queue full destination=%s",
-                destination_id,
-            )
-
-    await save_db()
+        await save_db()
 
 
 # ============================================================
-# ALBUM
+# ALBUM HANDLING
 # ============================================================
 
 async def flush_album(
@@ -1276,8 +1685,8 @@ async def flush_album(
 ):
 
     key = (
-        source_id,
-        media_group_id,
+        str(source_id),
+        str(media_group_id),
     )
 
     try:
@@ -1296,17 +1705,20 @@ async def flush_album(
         )
 
         if not message_ids:
+
             return
 
         message_ids = sorted(
-            set(message_ids)
+            set(
+                message_ids
+            )
         )
 
         db["stats"][
             "albums"
         ] += 1
 
-        await queue_for_destinations(
+        await queue_route(
             source_id,
             message_ids,
             True,
@@ -1318,13 +1730,13 @@ async def flush_album(
 
     except Exception as exc:
 
-        log.exception(
-            "Album flush error."
-        )
-
         db["stats"][
             "last_error"
         ] = str(exc)
+
+        log.exception(
+            "Album flush error."
+        )
 
     finally:
 
@@ -1335,7 +1747,7 @@ async def flush_album(
 
 
 # ============================================================
-# CHANNEL POST
+# NEW CHANNEL POST
 # ============================================================
 
 @router.channel_post()
@@ -1347,44 +1759,75 @@ async def channel_post_handler(
         message.chat.id
     )
 
-    log.info(
-        "CHANNEL POST received source=%s message=%s",
-        source_id,
-        message.message_id,
+    message_id = int(
+        message.message_id
     )
 
-    # Ignore unconfigured channels.
+    log.info(
+        "NEW CHANNEL POST "
+        "source=%s "
+        "message=%s",
+        source_id,
+        message_id,
+    )
+
+    #
+    # Only configured sources.
+    #
+
     if source_id not in source_ids():
 
         log.info(
-            "Ignoring unconfigured source=%s",
+            "Ignoring unconfigured "
+            "source=%s",
             source_id,
         )
 
         return
 
-    if not db["settings"]["enabled"]:
+    #
+    # Bot stopped.
+    #
 
-        log.info(
-            "Bot is stopped."
+    if not db["settings"][
+        "enabled"
+    ]:
+
+        return
+
+    #
+    # No route.
+    #
+
+    if not route_destinations(
+        source_id
+    ):
+
+        log.warning(
+            "Source has no destinations "
+            "source=%s",
+            source_id,
         )
 
         return
 
-    message_id = int(
-        message.message_id
-    )
+    #
+    # DEDUPE
+    #
 
     dedupe_key = (
-        f"{source_id}:{message_id}"
+        f"{source_id}:"
+        f"{message_id}"
     )
 
     async with seen_lock:
 
-        if dedupe_key in db["seen"]:
+        if dedupe_key in db[
+            "seen"
+        ]:
 
             log.info(
-                "Duplicate ignored: %s",
+                "Duplicate ignored %s",
                 dedupe_key,
             )
 
@@ -1396,13 +1839,18 @@ async def channel_post_handler(
             time.time()
         )
 
-        # Keep memory/database small.
-        if len(db["seen"]) > 10000:
+        #
+        # Keep JSON small.
+        #
+
+        if len(
+            db["seen"]
+        ) > 20000:
 
             oldest = sorted(
                 db["seen"].items(),
-                key=lambda x: x[1],
-            )[:2000]
+                key=lambda item: item[1],
+            )[:5000]
 
             for key, _ in oldest:
 
@@ -1410,6 +1858,10 @@ async def channel_post_handler(
                     key,
                     None
                 )
+
+    #
+    # STATS
+    #
 
     db["stats"][
         "received"
@@ -1423,25 +1875,31 @@ async def channel_post_handler(
 
     await save_db()
 
+    #
+    # ALBUM
+    #
+
     media_group_id = (
         message.media_group_id
     )
 
     if media_group_id:
 
-        key = (
+        album_key = (
             source_id,
-            str(media_group_id),
+            str(
+                media_group_id
+            ),
         )
 
         album_buffer[
-            key
+            album_key
         ].append(
             message_id
         )
 
         old_task = album_tasks.get(
-            key
+            album_key
         )
 
         if old_task:
@@ -1449,17 +1907,23 @@ async def channel_post_handler(
             old_task.cancel()
 
         album_tasks[
-            key
+            album_key
         ] = asyncio.create_task(
             flush_album(
                 source_id,
-                str(media_group_id),
+                str(
+                    media_group_id
+                ),
             )
         )
 
+    #
+    # NORMAL POST
+    #
+
     else:
 
-        await queue_for_destinations(
+        await queue_route(
             source_id,
             [message_id],
             False,
@@ -1467,10 +1931,12 @@ async def channel_post_handler(
 
 
 # ============================================================
-# START / ADMIN
+# /START
 # ============================================================
 
-@router.message(CommandStart())
+@router.message(
+    CommandStart()
+)
 async def start_handler(
     message: Message,
     state: FSMContext,
@@ -1478,7 +1944,9 @@ async def start_handler(
 
     await state.clear()
 
-    if not is_admin(message):
+    if not is_admin(
+        message
+    ):
 
         await message.answer(
             "Only admin can access this bot."
@@ -1492,7 +1960,13 @@ async def start_handler(
     )
 
 
-@router.message(Command("admin"))
+# ============================================================
+# /ADMIN
+# ============================================================
+
+@router.message(
+    Command("admin")
+)
 async def admin_handler(
     message: Message,
     state: FSMContext,
@@ -1500,7 +1974,9 @@ async def admin_handler(
 
     await state.clear()
 
-    if not is_admin(message):
+    if not is_admin(
+        message
+    ):
 
         await message.answer(
             "Only admin can access this bot."
@@ -1514,7 +1990,13 @@ async def admin_handler(
     )
 
 
-@router.message(Command("cancel"))
+# ============================================================
+# /CANCEL
+# ============================================================
+
+@router.message(
+    Command("cancel")
+)
 async def cancel_handler(
     message: Message,
     state: FSMContext,
@@ -1522,7 +2004,9 @@ async def cancel_handler(
 
     await state.clear()
 
-    if is_admin(message):
+    if is_admin(
+        message
+    ):
 
         await message.answer(
             "❌ Cancelled.",
@@ -1531,7 +2015,7 @@ async def cancel_handler(
 
 
 # ============================================================
-# CALLBACKS
+# CALLBACK HANDLER
 # ============================================================
 
 @router.callback_query()
@@ -1540,7 +2024,9 @@ async def callback_handler(
     state: FSMContext,
 ):
 
-    if not is_admin(query):
+    if not is_admin(
+        query
+    ):
 
         await query.answer(
             "Access denied.",
@@ -1549,16 +2035,20 @@ async def callback_handler(
 
         return
 
-    data = query.data or ""
+    data = (
+        query.data
+        or ""
+    )
 
     await query.answer()
 
     if not query.message:
+
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # HOME
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "home":
 
@@ -1571,9 +2061,9 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # TOGGLE
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "toggle":
 
@@ -1585,9 +2075,17 @@ async def callback_handler(
 
         await save_db()
 
-        if db["settings"]["enabled"]:
+        if db["settings"][
+            "enabled"
+        ]:
 
-            await ensure_workers()
+            await ensure_route_workers()
+
+        else:
+
+            log.info(
+                "Bot stopped."
+            )
 
         await query.message.edit_text(
             home_text(),
@@ -1596,34 +2094,62 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
-    # SOURCES
-    # --------------------------------------------------------
+    # ========================================================
+    # ROUTES
+    # ========================================================
 
     if data == "sources":
 
         text = (
-            "📥 <b>Source Channels</b>\n\n"
+            "🔀 "
+            "<b>Source → Destination Routes</b>\n\n"
         )
 
         if not db["sources"]:
 
             text += (
-                "No sources configured."
+                "No source channels configured."
             )
 
         else:
 
-            for index, item in enumerate(
+            for index, source in enumerate(
                 db["sources"],
                 1,
             ):
 
+                sid = str(
+                    source["id"]
+                )
+
+                destinations = (
+                    route_destinations(
+                        sid
+                    )
+                )
+
                 text += (
                     f"{index}. "
-                    f"<b>{display_name(item)}</b>\n"
-                    f"<code>{item['id']}</code>\n\n"
+                    f"<b>{display_name(source)}</b>\n"
                 )
+
+                if destinations:
+
+                    for destination in destinations:
+
+                        text += (
+                            f"   └ "
+                            f"{display_name(destination)}\n"
+                        )
+
+                else:
+
+                    text += (
+                        "   └ "
+                        "⚠️ No destination\n"
+                    )
+
+                text += "\n"
 
         await query.message.edit_text(
             text,
@@ -1632,9 +2158,174 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
-    # DESTINATIONS
-    # --------------------------------------------------------
+    # ========================================================
+    # OPEN ROUTE
+    # ========================================================
+
+    if data.startswith(
+        "route:"
+    ):
+
+        try:
+
+            index = int(
+                data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+            source = db[
+                "sources"
+            ][index]
+
+        except Exception:
+
+            return
+
+        source_id = str(
+            source["id"]
+        )
+
+        selected = (
+            route_destination_ids(
+                source_id
+            )
+        )
+
+        text = (
+            "🔀 <b>Route Configuration</b>\n\n"
+
+            f"Source:\n"
+            f"<b>{display_name(source)}</b>\n"
+            f"<code>{source_id}</code>\n\n"
+
+            f"Selected destinations: "
+            f"<b>{len(selected)}</b>\n\n"
+
+            "Tap a destination to "
+            "enable/disable this route."
+        )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=route_keyboard(
+                source_id
+            ),
+        )
+
+        return
+
+    # ========================================================
+    # ROUTE DESTINATION TOGGLE
+    # ========================================================
+
+    if data.startswith(
+        "route_dest:"
+    ):
+
+        try:
+
+            _, source_id, index = (
+                data.split(
+                    ":",
+                    2,
+                )
+            )
+
+            destination = db[
+                "destinations"
+            ][int(index)]
+
+        except Exception:
+
+            return
+
+        source_id = str(
+            source_id
+        )
+
+        if source_id not in source_ids():
+
+            return
+
+        destination_id = str(
+            destination["id"]
+        )
+
+        source = get_source(
+            source_id
+        )
+
+        if source is None:
+
+            return
+
+        route = db[
+            "routes"
+        ].setdefault(
+            source_id,
+            {
+                "source": source,
+                "destinations": [],
+            },
+        )
+
+        current_ids = {
+            str(item["id"])
+            for item in route[
+                "destinations"
+            ]
+        }
+
+        if destination_id in current_ids:
+
+            route[
+                "destinations"
+            ] = [
+                item
+                for item in route[
+                    "destinations"
+                ]
+                if str(
+                    item["id"]
+                ) != destination_id
+            ]
+
+            action = "removed"
+
+        else:
+
+            route[
+                "destinations"
+            ].append(
+                destination
+            )
+
+            action = "added"
+
+        await save_db()
+
+        await ensure_route_workers()
+
+        await query.message.edit_reply_markup(
+            reply_markup=route_keyboard(
+                source_id
+            )
+        )
+
+        await query.answer(
+            (
+                f"{display_name(destination)} "
+                f"{action}"
+            )
+        )
+
+        return
+
+    # ========================================================
+    # ALL DESTINATIONS
+    # ========================================================
 
     if data == "destinations":
 
@@ -1642,7 +2333,9 @@ async def callback_handler(
             "📤 <b>Destination Channels</b>\n\n"
         )
 
-        if not db["destinations"]:
+        if not db[
+            "destinations"
+        ]:
 
             text += (
                 "No destinations configured."
@@ -1650,24 +2343,33 @@ async def callback_handler(
 
         else:
 
-            for index, item in enumerate(
+            for index, destination in enumerate(
                 db["destinations"],
                 1,
             ):
 
-                destination_id = str(
-                    item["id"]
+                did = str(
+                    destination["id"]
                 )
 
-                queue = get_queue(
-                    destination_id
+                used_by = sum(
+                    1
+                    for source in db[
+                        "sources"
+                    ]
+                    if did
+                    in route_destination_ids(
+                        str(
+                            source["id"]
+                        )
+                    )
                 )
 
                 text += (
                     f"{index}. "
-                    f"<b>{display_name(item)}</b>\n"
-                    f"<code>{destination_id}</code>\n"
-                    f"Queue: <b>{queue.qsize()}</b>\n\n"
+                    f"<b>{display_name(destination)}</b>\n"
+                    f"Used by: <b>{used_by}</b> route(s)\n"
+                    f"<code>{did}</code>\n\n"
                 )
 
         await query.message.edit_text(
@@ -1677,9 +2379,221 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
+    # ADD SOURCE
+    # ========================================================
+
+    if data == "add_source":
+
+        await state.set_state(
+            AddSource.value
+        )
+
+        await query.message.edit_text(
+            "📥 <b>Add Source Channel</b>\n\n"
+
+            "Send channel username or ID:\n\n"
+
+            "<code>@channelusername</code>\n"
+            "or\n"
+            "<code>-1001234567890</code>\n\n"
+
+            "⚠️ Bot must be administrator "
+            "in the source channel.\n\n"
+
+            "After adding, select the "
+            "destination channels for this source."
+        )
+
+        return
+
+    # ========================================================
+    # ADD DESTINATION
+    # ========================================================
+
+    if data == "add_destination":
+
+        await state.set_state(
+            AddDestination.value
+        )
+
+        await query.message.edit_text(
+            "📤 <b>Add Destination Channel</b>\n\n"
+
+            "Send channel username or ID:\n\n"
+
+            "<code>@channelusername</code>\n"
+            "or\n"
+            "<code>-1001234567890</code>\n\n"
+
+            "⚠️ Bot must be administrator "
+            "with Post Messages permission."
+        )
+
+        return
+
+    # ========================================================
+    # ADD DESTINATION DIRECTLY TO ROUTE
+    # ========================================================
+
+    if data.startswith(
+        "new_dest_for:"
+    ):
+
+        source_id = data.split(
+            ":",
+            1,
+        )[1]
+
+        if source_id not in source_ids():
+
+            return
+
+        await state.update_data(
+            route_source_id=source_id
+        )
+
+        await state.set_state(
+            AddDestination.value
+        )
+
+        await query.message.edit_text(
+            "📤 <b>Add Destination</b>\n\n"
+
+            "Send @username or channel ID.\n\n"
+
+            "It will automatically be "
+            "connected to this source."
+        )
+
+        return
+
+    # ========================================================
+    # REMOVE SOURCE
+    # ========================================================
+
+    if data.startswith(
+        "remove_source:"
+    ):
+
+        source_id = data.split(
+            ":",
+            1,
+        )[1]
+
+        if source_id in source_ids():
+
+            db["sources"] = [
+                source
+                for source in db[
+                    "sources"
+                ]
+                if str(
+                    source["id"]
+                ) != source_id
+            ]
+
+            db["routes"].pop(
+                source_id,
+                None,
+            )
+
+            await stop_route_worker(
+                source_id
+            )
+
+            prefix = (
+                source_id
+                + ":"
+            )
+
+            db["seen"] = {
+                key: value
+                for key, value
+                in db[
+                    "seen"
+                ].items()
+                if not key.startswith(
+                    prefix
+                )
+            }
+
+            await save_db()
+
+        await query.message.edit_text(
+            "🔀 <b>Source → Destination Routes</b>",
+            reply_markup=sources_keyboard(),
+        )
+
+        return
+
+    # ========================================================
+    # DELETE DESTINATION
+    # ========================================================
+
+    if data.startswith(
+        "delete_destination:"
+    ):
+
+        try:
+
+            index = int(
+                data.split(
+                    ":",
+                    1,
+                )[1]
+            )
+
+            destination = db[
+                "destinations"
+            ].pop(
+                index
+            )
+
+        except Exception:
+
+            return
+
+        destination_id = str(
+            destination["id"]
+        )
+
+        #
+        # Remove this destination
+        # from EVERY route.
+        #
+
+        for route in db[
+            "routes"
+        ].values():
+
+            route[
+                "destinations"
+            ] = [
+                item
+                for item in route.get(
+                    "destinations",
+                    [],
+                )
+                if str(
+                    item["id"]
+                ) != destination_id
+            ]
+
+        await save_db()
+
+        await ensure_route_workers()
+
+        await query.message.edit_text(
+            "📤 <b>Destination Channels</b>",
+            reply_markup=destinations_keyboard(),
+        )
+
+        return
+
+    # ========================================================
     # SETTINGS
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "settings":
 
@@ -1690,33 +2604,45 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     if data == "status":
 
-        st = db["stats"]
+        stats = db[
+            "stats"
+        ]
 
-        queue_text = ""
+        queue_lines = []
 
-        for destination in db[
-            "destinations"
+        for source in db[
+            "sources"
         ]:
 
-            destination_id = str(
-                destination["id"]
+            sid = str(
+                source["id"]
             )
 
-            queue = get_queue(
-                destination_id
+            queue = route_queues.get(
+                sid
             )
 
-            queue_text += (
-                f"\n• "
-                f"{display_name(destination)}: "
-                f"<b>{queue.qsize()}</b>"
+            if queue:
+
+                queue_lines.append(
+                    f"• "
+                    f"{display_name(source)}: "
+                    f"<b>{queue.qsize()}</b>"
+                )
+
+        queue_text = (
+            "\n".join(
+                queue_lines
             )
+            if queue_lines
+            else "-"
+        )
 
         text = (
             "📊 <b>Bot Status</b>\n\n"
@@ -1724,32 +2650,30 @@ async def callback_handler(
             f"Running: "
             f"<b>{db['settings']['enabled']}</b>\n"
 
-            f"Workers: "
-            f"<b>{len(destination_tasks)}</b>\n\n"
+            f"Route workers: "
+            f"<b>{len(route_tasks)}</b>\n\n"
 
             f"📥 Received: "
-            f"<b>{st['received']}</b>\n"
+            f"<b>{stats['received']}</b>\n"
 
             f"📦 Queued: "
-            f"<b>{st['queued']}</b>\n"
+            f"<b>{stats['queued']}</b>\n"
 
             f"📤 Sent: "
-            f"<b>{st['sent']}</b>\n"
+            f"<b>{stats['sent']}</b>\n"
 
             f"❌ Failed: "
-            f"<b>{st['failed']}</b>\n"
-
-            f"⏭ Skipped: "
-            f"<b>{st['skipped']}</b>\n"
+            f"<b>{stats['failed']}</b>\n"
 
             f"🖼 Albums: "
-            f"<b>{st['albums']}</b>\n"
+            f"<b>{stats['albums']}</b>\n\n"
 
+            "<b>Route Queues</b>\n"
             f"{queue_text}\n\n"
 
-            f"Last error:\n"
+            "<b>Last Error</b>\n"
             f"<code>"
-            f"{st['last_error'] or '-'}"
+            f"{stats['last_error'] or '-'}"
             f"</code>"
         )
 
@@ -1769,155 +2693,9 @@ async def callback_handler(
 
         return
 
-    # --------------------------------------------------------
-    # ADD SOURCE
-    # --------------------------------------------------------
-
-    if data == "add_source":
-
-        await state.set_state(
-            AddSource.value
-        )
-
-        await query.message.edit_text(
-            "📥 <b>Add Source Channel</b>\n\n"
-            "Send channel username or ID:\n\n"
-            "<code>@channelusername</code>\n"
-            "or\n"
-            "<code>-1001234567890</code>\n\n"
-            "⚠️ Bot must be administrator "
-            "in the source channel."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ADD DESTINATION
-    # --------------------------------------------------------
-
-    if data == "add_destination":
-
-        await state.set_state(
-            AddDestination.value
-        )
-
-        await query.message.edit_text(
-            "📤 <b>Add Destination Channel</b>\n\n"
-            "Send channel username or ID:\n\n"
-            "<code>@channelusername</code>\n"
-            "or\n"
-            "<code>-1001234567890</code>\n\n"
-            "⚠️ Bot must be administrator "
-            "with Post Messages permission."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # DELETE SOURCE
-    # --------------------------------------------------------
-
-    if data.startswith(
-        "delete_source:"
-    ):
-
-        try:
-
-            index = int(
-                data.split(":")[1]
-            )
-
-        except Exception:
-
-            return
-
-        if (
-            0 <= index
-            < len(db["sources"])
-        ):
-
-            removed = db[
-                "sources"
-            ].pop(index)
-
-            source_id = str(
-                removed["id"]
-            )
-
-            prefix = (
-                source_id + ":"
-            )
-
-            db["seen"] = {
-                key: value
-                for key, value
-                in db["seen"].items()
-                if not key.startswith(
-                    prefix
-                )
-            }
-
-            await save_db()
-
-        await query.message.edit_text(
-            "📥 <b>Source Channels</b>",
-            reply_markup=sources_keyboard(),
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # DELETE DESTINATION
-    # --------------------------------------------------------
-
-    if data.startswith(
-        "delete_destination:"
-    ):
-
-        try:
-
-            index = int(
-                data.split(":")[1]
-            )
-
-        except Exception:
-
-            return
-
-        if (
-            0 <= index
-            < len(db["destinations"])
-        ):
-
-            removed = db[
-                "destinations"
-            ].pop(index)
-
-            destination_id = str(
-                removed["id"]
-            )
-
-            await stop_worker(
-                destination_id
-            )
-
-            destination_queues.pop(
-                destination_id,
-                None,
-            )
-
-            await save_db()
-
-        await query.message.edit_text(
-            "📤 <b>Destination Channels</b>",
-            reply_markup=destinations_keyboard(),
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SETTINGS
-    # --------------------------------------------------------
+    # ========================================================
+    # SET INTERVAL
+    # ========================================================
 
     if data == "setting:interval":
 
@@ -1926,13 +2704,21 @@ async def callback_handler(
         )
 
         await query.message.edit_text(
-            "⏱ <b>Set Interval</b>\n\n"
-            "Enter seconds.\n"
-            "Example: <code>2</code>\n\n"
-            "Recommended: 1-5 seconds."
+            "⏱ <b>Set Copy Interval</b>\n\n"
+
+            "Enter seconds.\n\n"
+
+            "Example:\n"
+            "<code>1</code>\n\n"
+
+            "Recommended: 1–3 seconds."
         )
 
         return
+
+    # ========================================================
+    # SET ALBUM WAIT
+    # ========================================================
 
     if data == "setting:album":
 
@@ -1942,11 +2728,18 @@ async def callback_handler(
 
         await query.message.edit_text(
             "📦 <b>Album Wait</b>\n\n"
-            "Enter seconds.\n"
-            "Example: <code>1.5</code>"
+
+            "Enter seconds.\n\n"
+
+            "Example:\n"
+            "<code>1.5</code>"
         )
 
         return
+
+    # ========================================================
+    # SET RETRIES
+    # ========================================================
 
     if data == "setting:retries":
 
@@ -1956,11 +2749,18 @@ async def callback_handler(
 
         await query.message.edit_text(
             "🔁 <b>Retries</b>\n\n"
-            "Enter 0-20.\n"
-            "Example: <code>5</code>"
+
+            "Enter 0–20.\n\n"
+
+            "Example:\n"
+            "<code>5</code>"
         )
 
         return
+
+    # ========================================================
+    # SET QUEUE
+    # ========================================================
 
     if data == "setting:queue":
 
@@ -1970,32 +2770,18 @@ async def callback_handler(
 
         await query.message.edit_text(
             "📚 <b>Queue Limit</b>\n\n"
-            "Enter 10-50000.\n"
-            "Example: <code>5000</code>"
-        )
 
-        return
+            "Enter 100–50000.\n\n"
 
-    if data == "setting:skip":
-
-        db["settings"][
-            "skip_failed"
-        ] = not db["settings"][
-            "skip_failed"
-        ]
-
-        await save_db()
-
-        await query.message.edit_text(
-            "⚙️ <b>Settings</b>",
-            reply_markup=settings_keyboard(),
+            "Example:\n"
+            "<code>10000</code>"
         )
 
         return
 
 
 # ============================================================
-# ADD SOURCE
+# ADD SOURCE MESSAGE
 # ============================================================
 
 @router.message(
@@ -2006,11 +2792,15 @@ async def add_source_handler(
     state: FSMContext,
 ):
 
-    if not is_admin(message):
+    if not is_admin(
+        message
+    ):
+
         return
 
     value = (
-        message.text or ""
+        message.text
+        or ""
     ).strip()
 
     if not value:
@@ -2023,44 +2813,58 @@ async def add_source_handler(
 
     try:
 
-        item = await resolve_chat(
+        source = await resolve_chat(
             value
         )
 
-        chat_id = str(
-            item["id"]
+        source_id = str(
+            source["id"]
         )
 
-        if chat_id in source_ids():
+        if source_id in source_ids():
 
             await message.answer(
-                "⚠️ Source already exists."
+                "⚠️ Source already exists.",
             )
 
         else:
 
-            db["sources"].append(
-                item
+            db[
+                "sources"
+            ].append(
+                source
             )
+
+            db[
+                "routes"
+            ][source_id] = {
+                "source": source,
+                "destinations": [],
+            }
 
             await save_db()
 
             await message.answer(
                 (
                     "✅ <b>Source Added</b>\n\n"
-                    f"Name: "
-                    f"<b>{item['title']}</b>\n"
-                    f"ID: <code>{item['id']}</code>\n\n"
-                    "📡 Only NEW posts will be monitored."
+
+                    f"Source:\n"
+                    f"<b>{display_name(source)}</b>\n"
+                    f"<code>{source_id}</code>\n\n"
+
+                    "📡 Only NEW posts will be monitored.\n\n"
+
+                    "Now select destination channels."
                 ),
-                reply_markup=sources_keyboard(),
+                reply_markup=route_keyboard(
+                    source_id
+                ),
             )
 
     except Exception as exc:
 
-        log.error(
-            "Add source failed: %s",
-            exc,
+        log.exception(
+            "Add source failed."
         )
 
         await message.answer(
@@ -2076,7 +2880,7 @@ async def add_source_handler(
 
 
 # ============================================================
-# ADD DESTINATION
+# ADD DESTINATION MESSAGE
 # ============================================================
 
 @router.message(
@@ -2087,11 +2891,15 @@ async def add_destination_handler(
     state: FSMContext,
 ):
 
-    if not is_admin(message):
+    if not is_admin(
+        message
+    ):
+
         return
 
     value = (
-        message.text or ""
+        message.text
+        or ""
     ).strip()
 
     if not value:
@@ -2102,54 +2910,122 @@ async def add_destination_handler(
 
         return
 
+    state_data = await state.get_data()
+
+    route_source_id = (
+        state_data.get(
+            "route_source_id"
+        )
+    )
+
     try:
 
-        item = await resolve_chat(
+        destination = await resolve_chat(
             value
         )
 
-        chat_id = str(
-            item["id"]
+        destination_id = str(
+            destination["id"]
         )
 
         await verify_destination(
-            chat_id
+            destination_id
         )
 
-        if chat_id in destination_ids():
+        #
+        # Add to global destination
+        # registry only if new.
+        #
 
-            await message.answer(
-                "⚠️ Destination already exists."
-            )
-
-        else:
+        if destination_id not in destination_ids():
 
             db[
                 "destinations"
-            ].append(item)
+            ].append(
+                destination
+            )
+
+        #
+        # If opened from a route,
+        # connect destination directly.
+        #
+
+        if (
+            route_source_id
+            and route_source_id
+            in source_ids()
+        ):
+
+            source = get_source(
+                route_source_id
+            )
+
+            route = db[
+                "routes"
+            ].setdefault(
+                route_source_id,
+                {
+                    "source": source,
+                    "destinations": [],
+                },
+            )
+
+            existing = {
+                str(item["id"])
+                for item in route[
+                    "destinations"
+                ]
+            }
+
+            if destination_id not in existing:
+
+                route[
+                    "destinations"
+                ].append(
+                    destination
+                )
 
             await save_db()
 
-            await start_worker(
-                chat_id
+            await start_route_worker(
+                route_source_id
             )
 
             await message.answer(
                 (
                     "✅ <b>Destination Added</b>\n\n"
-                    f"Name: "
-                    f"<b>{item['title']}</b>\n"
-                    f"ID: <code>{item['id']}</code>\n\n"
-                    "🚀 Ready to receive copied posts."
+
+                    f"Source:\n"
+                    f"<b>{display_name(source)}</b>\n\n"
+
+                    f"Destination:\n"
+                    f"<b>{display_name(destination)}</b>\n\n"
+
+                    "🚀 Route is active."
+                ),
+                reply_markup=route_keyboard(
+                    route_source_id
+                ),
+            )
+
+        else:
+
+            await save_db()
+
+            await message.answer(
+                (
+                    "✅ <b>Destination Added</b>\n\n"
+                    f"<b>{display_name(destination)}</b>\n\n"
+                    "Go to Routes and select "
+                    "which sources should send here."
                 ),
                 reply_markup=destinations_keyboard(),
             )
 
     except Exception as exc:
 
-        log.error(
-            "Add destination failed: %s",
-            exc,
+        log.exception(
+            "Add destination failed."
         )
 
         await message.answer(
@@ -2180,14 +3056,22 @@ async def set_interval_handler(
 
         value = float(
             (
-                message.text or ""
+                message.text
+                or ""
             ).strip()
         )
 
-        if not 0.1 <= value <= 3600:
+        if not (
+            0.1
+            <= value
+            <= 3600
+        ):
+
             raise ValueError
 
-        db["settings"][
+        db[
+            "settings"
+        ][
             "interval"
         ] = value
 
@@ -2221,7 +3105,7 @@ async def set_interval_handler(
 @router.message(
     SetAlbumWait.value
 )
-async def set_album_handler(
+async def set_album_wait_handler(
     message: Message,
     state: FSMContext,
 ):
@@ -2230,14 +3114,22 @@ async def set_album_handler(
 
         value = float(
             (
-                message.text or ""
+                message.text
+                or ""
             ).strip()
         )
 
-        if not 0.2 <= value <= 10:
+        if not (
+            0.2
+            <= value
+            <= 10
+        ):
+
             raise ValueError
 
-        db["settings"][
+        db[
+            "settings"
+        ][
             "album_wait"
         ] = value
 
@@ -2280,21 +3172,29 @@ async def set_retries_handler(
 
         value = int(
             (
-                message.text or ""
+                message.text
+                or ""
             ).strip()
         )
 
-        if not 0 <= value <= 20:
+        if not (
+            0
+            <= value
+            <= 20
+        ):
+
             raise ValueError
 
-        db["settings"][
+        db[
+            "settings"
+        ][
             "retries"
         ] = value
 
         await save_db()
 
         await message.answer(
-            "✅ Retry setting updated.",
+            "✅ Retries updated.",
             reply_markup=settings_keyboard(),
         )
 
@@ -2327,45 +3227,47 @@ async def set_queue_handler(
 
         value = int(
             (
-                message.text or ""
+                message.text
+                or ""
             ).strip()
         )
 
-        if not 10 <= value <= 50000:
+        if not (
+            100
+            <= value
+            <= 50000
+        ):
+
             raise ValueError
 
-        db["settings"][
+        db[
+            "settings"
+        ][
             "max_queue"
         ] = value
 
         await save_db()
 
-        # Recreate queues with new size.
-        for destination_id in list(
-            destination_queues
-        ):
-
-            queue = destination_queues[
-                destination_id
-            ]
-
-            if queue.empty():
-
-                destination_queues[
-                    destination_id
-                ] = asyncio.Queue(
-                    maxsize=value
-                )
+        #
+        # Existing queues are intentionally
+        # not destroyed because that would
+        # delete pending posts.
+        #
+        # New queues will use the new size.
+        #
 
         await message.answer(
-            "✅ Queue limit updated.",
+            (
+                "✅ Queue limit updated.\n\n"
+                "Existing pending queues were preserved."
+            ),
             reply_markup=settings_keyboard(),
         )
 
     except ValueError:
 
         await message.answer(
-            "❌ Enter an integer from 10 to 50000."
+            "❌ Enter an integer from 100 to 50000."
         )
 
         return
@@ -2386,28 +3288,47 @@ async def health_handler(
     return web.json_response(
         {
             "ok": True,
+
             "mode": "webhook",
+
             "running": bool(
-                db["settings"]["enabled"]
+                db["settings"][
+                    "enabled"
+                ]
             ),
+
             "sources": len(
                 db["sources"]
             ),
+
             "destinations": len(
                 db["destinations"]
             ),
+
+            "routes": route_count(),
+
             "workers": len(
-                destination_tasks
+                route_tasks
             ),
-            "received": db["stats"][
+
+            "received": db[
+                "stats"
+            ][
                 "received"
             ],
-            "sent": db["stats"][
+
+            "sent": db[
+                "stats"
+            ][
                 "sent"
             ],
-            "failed": db["stats"][
+
+            "failed": db[
+                "stats"
+            ][
                 "failed"
             ],
+
             "time": int(
                 time.time()
             ),
@@ -2416,7 +3337,7 @@ async def health_handler(
 
 
 # ============================================================
-# TELEGRAM WEBHOOK
+# WEBHOOK
 # ============================================================
 
 async def telegram_webhook(
@@ -2424,6 +3345,28 @@ async def telegram_webhook(
 ):
 
     try:
+
+        #
+        # Verify Telegram secret.
+        #
+
+        incoming_secret = (
+            request.headers.get(
+                "X-Telegram-Bot-Api-Secret-Token",
+                "",
+            )
+        )
+
+        if incoming_secret != WEBHOOK_SECRET:
+
+            log.warning(
+                "Invalid webhook secret."
+            )
+
+            return web.Response(
+                status=403,
+                text="Forbidden",
+            )
 
         raw = await request.read()
 
@@ -2434,9 +3377,21 @@ async def telegram_webhook(
                 text="Empty update",
             )
 
-        update = Update.model_validate_json(
-            raw
+        update = (
+            Update.model_validate_json(
+                raw
+            )
         )
+
+        if (
+            dp is None
+            or bot is None
+        ):
+
+            return web.Response(
+                status=503,
+                text="Bot not ready",
+            )
 
         await dp.feed_update(
             bot,
@@ -2450,8 +3405,7 @@ async def telegram_webhook(
     except Exception as exc:
 
         log.exception(
-            "Webhook update error: %s",
-            exc,
+            "Webhook update error."
         )
 
         return web.Response(
@@ -2461,7 +3415,7 @@ async def telegram_webhook(
 
 
 # ============================================================
-# START WEB SERVER
+# WEB SERVER
 # ============================================================
 
 async def start_web_server():
@@ -2505,18 +3459,20 @@ async def start_web_server():
     await site.start()
 
     log.info(
-        "HTTP server started on port %s",
+        "HTTP server started "
+        "port=%s",
         PORT,
     )
 
 
 # ============================================================
-# SET WEBHOOK
+# SET TELEGRAM WEBHOOK
 # ============================================================
 
 async def setup_webhook():
 
     if bot is None:
+
         return
 
     webhook_url = (
@@ -2525,22 +3481,29 @@ async def setup_webhook():
     )
 
     log.info(
-        "Setting Telegram webhook: %s",
+        "Setting webhook: %s",
         webhook_url,
     )
 
     await bot.set_webhook(
         url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
+
+        secret_token=(
+            WEBHOOK_SECRET
+        ),
+
         allowed_updates=[
             "message",
             "callback_query",
             "channel_post",
         ],
+
         drop_pending_updates=False,
     )
 
-    info = await bot.get_webhook_info()
+    info = (
+        await bot.get_webhook_info()
+    )
 
     log.info(
         "Webhook active: %s",
@@ -2550,16 +3513,25 @@ async def setup_webhook():
     if info.last_error_message:
 
         log.error(
-            "Telegram webhook last error: %s",
+            "Telegram webhook error: %s",
             info.last_error_message,
+        )
+
+        log.error(
+            "Webhook pending updates: %s",
+            info.pending_update_count,
         )
 
 
 # ============================================================
-# CLEANUP
+# SHUTDOWN
 # ============================================================
 
 async def shutdown():
+
+    #
+    # Cancel album timers.
+    #
 
     for task in list(
         album_tasks.values()
@@ -2572,20 +3544,30 @@ async def shutdown():
     ):
 
         try:
+
             await task
 
         except asyncio.CancelledError:
+
             pass
 
     album_tasks.clear()
 
-    for destination_id in list(
-        destination_tasks
+    #
+    # Stop route workers.
+    #
+
+    for source_id in list(
+        route_tasks
     ):
 
-        await stop_worker(
-            destination_id
+        await stop_route_worker(
+            source_id
         )
+
+    #
+    # Web server.
+    #
 
     if server_runner:
 
@@ -2599,15 +3581,15 @@ async def shutdown():
 async def main():
 
     global bot
+    global dp
 
     bot = Bot(
         token=BOT_TOKEN,
+
         default=DefaultBotProperties(
             parse_mode=ParseMode.HTML
         ),
     )
-
-    global dp
 
     dp = Dispatcher()
 
@@ -2618,7 +3600,8 @@ async def main():
     me = await bot.get_me()
 
     log.info(
-        "Bot connected: @%s | ID=%s",
+        "Bot connected "
+        "@%s | ID=%s",
         me.username,
         me.id,
     )
@@ -2627,10 +3610,10 @@ async def main():
 
     await setup_webhook()
 
-    await ensure_workers()
+    await ensure_route_workers()
 
     log.info(
-        "========================================"
+        "=========================================="
     )
 
     log.info(
@@ -2638,20 +3621,35 @@ async def main():
     )
 
     log.info(
-        "Only NEW channel posts are monitored."
+        "ROUTE MODE ENABLED"
     )
 
     log.info(
-        "No API ID / API HASH required."
+        "NEW POSTS ONLY"
     )
 
     log.info(
-        "========================================"
+        "NO OLD HISTORY SCAN"
+    )
+
+    log.info(
+        "NO API ID / API HASH"
+    )
+
+    log.info(
+        "INDEPENDENT SOURCE WORKERS"
+    )
+
+    log.info(
+        "=========================================="
     )
 
     try:
 
-        # Keep Render process alive.
+        #
+        # Keep Render process alive forever.
+        #
+
         await asyncio.Event().wait()
 
     finally:
@@ -2665,10 +3663,15 @@ async def main():
             )
 
         except Exception:
+
             pass
 
         await bot.session.close()
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
