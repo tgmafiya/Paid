@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -69,16 +70,20 @@ if not BOT_TOKEN:
         "BOT_TOKEN is missing."
     )
 
-
 if not ADMIN_ID_RAW.isdigit():
     raise RuntimeError(
         "ADMIN_ID must be numeric."
     )
 
+if (
+    not WEBHOOK_SECRET
+    or WEBHOOK_SECRET == "change-this-secret"
+):
+    raise RuntimeError(
+        "Please set a real WEBHOOK_SECRET in Render Environment Variables."
+    )
 
-ADMIN_ID = int(
-    ADMIN_ID_RAW
-)
+ADMIN_ID = int(ADMIN_ID_RAW)
 
 
 # ============================================================
@@ -96,7 +101,7 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(
-    "route-channel-copy"
+    "route-channel-cycle-bot"
 )
 
 
@@ -105,19 +110,33 @@ log = logging.getLogger(
 # ============================================================
 
 DEFAULT_SETTINGS = {
-    # Delay between destination copies.
+    # Bot accepts new posts.
+    "enabled": True,
+
+    # Delay between copies.
     "interval": 1.0,
 
-    # Retry count for temporary/network errors.
-    "retries": 5,
+    # Temporary error retries.
+    "retries": 8,
 
-    # Time to wait for all album messages.
+    # Album collection time.
     "album_wait": 1.5,
 
-    # Maximum pending posts per source route.
+    # Maximum waiting queue size.
     "max_queue": 10000,
 
-    "enabled": True,
+    # --------------------------------------------------------
+    # CYCLING
+    # --------------------------------------------------------
+
+    # Repeat saved posts forever.
+    "cycle_enabled": True,
+
+    # Delay before starting next cycle.
+    "cycle_delay": 1.0,
+
+    # Delay between posts during cycle.
+    "cycle_interval": 1.0,
 }
 
 
@@ -134,15 +153,25 @@ def default_db() -> dict[str, Any]:
 
         "destinations": [],
 
-        # IMPORTANT:
+        "routes": {},
+
+        # ----------------------------------------------------
+        # POST HISTORY
+        # ----------------------------------------------------
         #
         # source_id:
-        # {
-        #   "source": {...},
-        #   "destinations": [...]
-        # }
+        # [
+        #     {
+        #         "message_ids": [1],
+        #         "is_album": false
+        #     },
+        #     {
+        #         "message_ids": [2, 3],
+        #         "is_album": true
+        #     }
+        # ]
         #
-        "routes": {},
+        "history": {},
 
         "stats": {
             "received": 0,
@@ -150,9 +179,11 @@ def default_db() -> dict[str, Any]:
             "sent": 0,
             "failed": 0,
             "albums": 0,
+            "cycles": 0,
 
             "last_received": None,
             "last_sent": None,
+            "last_cycle": None,
             "last_error": None,
         },
 
@@ -177,7 +208,8 @@ def load_db() -> dict[str, Any]:
     except Exception:
 
         log.exception(
-            "Could not read data.json"
+            "Could not read data.json. "
+            "Starting fresh."
         )
 
         return default_db()
@@ -240,35 +272,42 @@ def load_db() -> dict[str, Any]:
     # OLD DATABASE MIGRATION
     # --------------------------------------------------------
 
-    else:
+    elif (
+        fresh["sources"]
+        and fresh["destinations"]
+    ):
 
-        # Old version had all sources and all destinations
-        # globally connected.
-        #
-        # Convert that into:
-        #
-        # Every old source -> every old destination.
-        #
+        log.warning(
+            "Migrating old global source/destination database."
+        )
 
-        if (
-            fresh["sources"]
-            and fresh["destinations"]
-        ):
+        for source in fresh[
+            "sources"
+        ]:
 
-            for source in fresh[
-                "sources"
-            ]:
+            sid = str(
+                source["id"]
+            )
 
-                sid = str(
-                    source["id"]
-                )
+            fresh["routes"][sid] = {
+                "source": source,
+                "destinations": list(
+                    fresh["destinations"]
+                ),
+            }
 
-                fresh["routes"][sid] = {
-                    "source": source,
-                    "destinations": list(
-                        fresh["destinations"]
-                    ),
-                }
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
+
+    if isinstance(
+        data.get("history"),
+        dict,
+    ):
+
+        fresh["history"] = data[
+            "history"
+        ]
 
     # --------------------------------------------------------
     # STATS
@@ -302,6 +341,7 @@ def load_db() -> dict[str, Any]:
 db = load_db()
 
 db_lock = asyncio.Lock()
+seen_lock = asyncio.Lock()
 
 
 async def save_db():
@@ -334,7 +374,7 @@ async def save_db():
 
 
 # ============================================================
-# GLOBAL RUNTIME
+# RUNTIME
 # ============================================================
 
 router = Router()
@@ -343,32 +383,19 @@ bot: Bot | None = None
 
 dp: Dispatcher | None = None
 
-server_runner: (
-    web.AppRunner | None
-) = None
+server_runner: web.AppRunner | None = None
 
 
 # ============================================================
-# ROUTE QUEUES
+# SOURCE QUEUES
 # ============================================================
 
-#
-# ONE QUEUE PER SOURCE
-#
-# Source 1 -> Queue 1 -> Worker 1
-# Source 2 -> Queue 2 -> Worker 2
-# Source 3 -> Queue 3 -> Worker 3
-#
-# This is the important fix.
-#
-
-route_queues: dict[
+source_queues: dict[
     str,
     asyncio.Queue,
 ] = {}
 
-
-route_tasks: dict[
+source_tasks: dict[
     str,
     asyncio.Task,
 ] = {}
@@ -383,14 +410,10 @@ album_tasks: dict[
     asyncio.Task,
 ] = {}
 
-
 album_buffer: dict[
     tuple[str, str],
     list[int],
 ] = defaultdict(list)
-
-
-seen_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -398,32 +421,34 @@ seen_lock = asyncio.Lock()
 # ============================================================
 
 class AddSource(StatesGroup):
-
     value = State()
 
 
 class AddDestination(StatesGroup):
-
     value = State()
 
 
 class SetInterval(StatesGroup):
-
     value = State()
 
 
 class SetRetries(StatesGroup):
-
     value = State()
 
 
 class SetAlbumWait(StatesGroup):
-
     value = State()
 
 
 class SetQueue(StatesGroup):
+    value = State()
 
+
+class SetCycleDelay(StatesGroup):
+    value = State()
+
+
+class SetCycleInterval(StatesGroup):
     value = State()
 
 
@@ -442,7 +467,7 @@ def is_admin(
 
 
 # ============================================================
-# DATABASE HELPERS
+# HELPERS
 # ============================================================
 
 def source_ids() -> set[str]:
@@ -465,13 +490,9 @@ def get_source(
     source_id: str,
 ) -> dict[str, Any] | None:
 
-    source_id = str(
-        source_id
-    )
+    source_id = str(source_id)
 
-    for source in db[
-        "sources"
-    ]:
+    for source in db["sources"]:
 
         if str(
             source["id"]
@@ -486,13 +507,9 @@ def get_destination(
     destination_id: str,
 ) -> dict[str, Any] | None:
 
-    destination_id = str(
-        destination_id
-    )
+    destination_id = str(destination_id)
 
-    for destination in db[
-        "destinations"
-    ]:
+    for destination in db["destinations"]:
 
         if str(
             destination["id"]
@@ -511,10 +528,7 @@ def display_name(
         item.get("title")
         or item.get("username")
         or str(
-            item.get(
-                "id",
-                "Unknown",
-            )
+            item.get("id", "Unknown")
         )
     )
 
@@ -559,23 +573,27 @@ def route_destination_ids(
 
 def route_count() -> int:
 
-    count = 0
-
-    for source in db[
-        "sources"
-    ]:
-
-        sid = str(
-            source["id"]
-        )
-
+    return sum(
+        1
+        for source in db["sources"]
         if route_destinations(
-            sid
-        ):
+            str(source["id"])
+        )
+    )
 
-            count += 1
 
-    return count
+def history_count(
+    source_id: str,
+) -> int:
+
+    history = db[
+        "history"
+    ].get(
+        str(source_id),
+        [],
+    )
+
+    return len(history)
 
 
 # ============================================================
@@ -592,44 +610,45 @@ def home_text() -> str:
         "stats"
     ]
 
-    status = (
+    running = (
         "🟢 RUNNING"
         if settings["enabled"]
         else "🔴 STOPPED"
     )
 
-    return (
-        "🤖 <b>Route Channel Copy Bot</b>\n\n"
+    cycling = (
+        "🟢 ON"
+        if settings["cycle_enabled"]
+        else "🔴 OFF"
+    )
 
-        f"Status: <b>{status}</b>\n"
+    return (
+        "🤖 <b>Route Channel Cycle Bot</b>\n\n"
+
+        f"Status: <b>{running}</b>\n"
         f"Sources: <b>{len(db['sources'])}</b>\n"
         f"Destinations: "
         f"<b>{len(db['destinations'])}</b>\n"
         f"Routes: <b>{route_count()}</b>\n\n"
 
-        f"⏱ Interval: "
+        f"🔁 Cycle: <b>{cycling}</b>\n"
+        f"⏱ Copy interval: "
         f"<b>{settings['interval']}s</b>\n"
-
+        f"🔄 Cycle delay: "
+        f"<b>{settings['cycle_delay']}s</b>\n"
         f"📦 Album wait: "
         f"<b>{settings['album_wait']}s</b>\n"
-
         f"🔁 Retries: "
-        f"<b>{settings['retries']}</b>\n"
-
-        f"📚 Queue: "
-        f"<b>{settings['max_queue']}</b>\n\n"
+        f"<b>{settings['retries']}</b>\n\n"
 
         f"📥 Received: "
         f"<b>{stats['received']}</b>\n"
-
-        f"📦 Queued: "
-        f"<b>{stats['queued']}</b>\n"
-
         f"📤 Sent: "
         f"<b>{stats['sent']}</b>\n"
-
         f"❌ Failed: "
-        f"<b>{stats['failed']}</b>"
+        f"<b>{stats['failed']}</b>\n"
+        f"♻️ Cycles: "
+        f"<b>{stats['cycles']}</b>"
     )
 
 
@@ -643,6 +662,10 @@ def home_keyboard():
         "settings"
     ]["enabled"]
 
+    cycle = db[
+        "settings"
+    ]["cycle_enabled"]
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
 
@@ -654,7 +677,16 @@ def home_keyboard():
                         else "▶️ Start"
                     ),
                     callback_data="toggle",
-                )
+                ),
+
+                InlineKeyboardButton(
+                    text=(
+                        "♻️ Cycle ON"
+                        if cycle
+                        else "♻️ Cycle OFF"
+                    ),
+                    callback_data="cycle_toggle",
+                ),
             ],
 
             [
@@ -709,13 +741,18 @@ def sources_keyboard():
             )
         )
 
+        history = history_count(
+            sid
+        )
+
         rows.append(
             [
                 InlineKeyboardButton(
                     text=(
                         f"🔀 "
                         f"{display_name(source)} "
-                        f"[{count}]"
+                        f"[{count}] "
+                        f"♻️{history}"
                     ),
                     callback_data=(
                         f"route:{index}"
@@ -802,6 +839,18 @@ def route_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
+                text="🗑 Clear History",
+                callback_data=(
+                    f"clear_history:"
+                    f"{source_id}"
+                ),
+            )
+        ]
+    )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
                 text="❌ Remove Source",
                 callback_data=(
                     f"remove_source:"
@@ -839,14 +888,10 @@ def destinations_keyboard():
 
         used_by = sum(
             1
-            for source in db[
-                "sources"
-            ]
+            for source in db["sources"]
             if did
             in route_destination_ids(
-                str(
-                    source["id"]
-                )
+                str(source["id"])
             )
         )
 
@@ -901,11 +946,23 @@ def settings_keyboard():
             [
                 InlineKeyboardButton(
                     text=(
-                        f"⏱ Interval: "
+                        f"⏱ Copy interval: "
                         f"{settings['interval']}s"
                     ),
                     callback_data=(
                         "setting:interval"
+                    ),
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"🔄 Cycle delay: "
+                        f"{settings['cycle_delay']}s"
+                    ),
+                    callback_data=(
+                        "setting:cycle_delay"
                     ),
                 )
             ],
@@ -943,7 +1000,15 @@ def settings_keyboard():
                     callback_data=(
                         "setting:queue"
                     ),
-                )
+                ],
+
+                InlineKeyboardButton(
+                    text=(
+                        f"♻️ Cycle "
+                        f"{'ON' if settings['cycle_enabled'] else 'OFF'}"
+                    ),
+                    callback_data="cycle_toggle",
+                ),
             ],
 
             [
@@ -1004,9 +1069,7 @@ async def resolve_chat(
         )
 
     return {
-        "id": str(
-            chat.id
-        ),
+        "id": str(chat.id),
 
         "title": (
             chat.title
@@ -1056,10 +1119,109 @@ async def verify_destination(
 
 
 # ============================================================
-# ROUTE WORKERS
+# HISTORY
 # ============================================================
 
-async def start_route_worker(
+async def add_history(
+    source_id: str,
+    message_ids: list[int],
+    is_album: bool,
+):
+
+    source_id = str(
+        source_id
+    )
+
+    history = db[
+        "history"
+    ].setdefault(
+        source_id,
+        [],
+    )
+
+    clean_ids = sorted(
+        {
+            int(x)
+            for x in message_ids
+        }
+    )
+
+    if not clean_ids:
+        return
+
+    # --------------------------------------------------------
+    # Do not add duplicate history item.
+    # --------------------------------------------------------
+
+    existing_keys = {
+        tuple(
+            int(x)
+            for x in item.get(
+                "message_ids",
+                [],
+            )
+        )
+        for item in history
+        if isinstance(item, dict)
+    }
+
+    key = tuple(clean_ids)
+
+    if key in existing_keys:
+        return
+
+    history.append(
+        {
+            "message_ids": clean_ids,
+            "is_album": bool(
+                is_album
+            ),
+            "created_at": int(
+                time.time()
+            ),
+        }
+    )
+
+    # --------------------------------------------------------
+    # Keep history reasonable.
+    # 50,000 posts/albums per source.
+    # --------------------------------------------------------
+
+    if len(history) > 50000:
+
+        del history[
+            :len(history) - 50000
+        ]
+
+    await save_db()
+
+
+def get_history(
+    source_id: str,
+) -> list[dict[str, Any]]:
+
+    history = db[
+        "history"
+    ].get(
+        str(source_id),
+        [],
+    )
+
+    if not isinstance(
+        history,
+        list,
+    ):
+
+        return []
+
+    return history
+
+
+# ============================================================
+# WORKERS
+# ============================================================
+
+async def start_source_worker(
     source_id: str,
 ):
 
@@ -1067,9 +1229,9 @@ async def start_route_worker(
         source_id
     )
 
-    if source_id not in route_queues:
+    if source_id not in source_queues:
 
-        route_queues[
+        source_queues[
             source_id
         ] = asyncio.Queue(
             maxsize=int(
@@ -1079,27 +1241,33 @@ async def start_route_worker(
             )
         )
 
-    existing_task = route_tasks.get(
+    task = source_tasks.get(
         source_id
     )
 
     if (
-        existing_task
-        and not existing_task.done()
+        task
+        and not task.done()
     ):
 
         return
 
-    route_tasks[
+    source_tasks[
         source_id
     ] = asyncio.create_task(
-        route_worker(
+        source_worker(
             source_id
         )
     )
 
+    log.info(
+        "SOURCE WORKER STARTED "
+        "source=%s",
+        source_id,
+    )
 
-async def stop_route_worker(
+
+async def stop_source_worker(
     source_id: str,
 ):
 
@@ -1107,7 +1275,7 @@ async def stop_route_worker(
         source_id
     )
 
-    task = route_tasks.pop(
+    task = source_tasks.pop(
         source_id,
         None,
     )
@@ -1124,55 +1292,51 @@ async def stop_route_worker(
 
             pass
 
-    route_queues.pop(
+    source_queues.pop(
         source_id,
         None,
     )
 
 
-async def ensure_route_workers():
-
-    if not db["settings"]["enabled"]:
-
-        return
+async def ensure_workers():
 
     wanted = set()
 
-    for source in db[
-        "sources"
-    ]:
+    if db["settings"]["enabled"]:
 
-        sid = str(
-            source["id"]
-        )
+        for source in db["sources"]:
 
-        if route_destinations(
-            sid
-        ):
-
-            wanted.add(
-                sid
+            sid = str(
+                source["id"]
             )
+
+            if route_destinations(
+                sid
+            ):
+
+                wanted.add(
+                    sid
+                )
 
     for sid in wanted:
 
-        await start_route_worker(
+        await start_source_worker(
             sid
         )
 
     for sid in list(
-        route_tasks
+        source_tasks
     ):
 
         if sid not in wanted:
 
-            await stop_route_worker(
+            await stop_source_worker(
                 sid
             )
 
 
 # ============================================================
-# COPY SINGLE MESSAGE
+# COPY SINGLE
 # ============================================================
 
 async def copy_single(
@@ -1182,7 +1346,6 @@ async def copy_single(
 ) -> bool:
 
     if bot is None:
-
         return False
 
     retries = int(
@@ -1198,8 +1361,7 @@ async def copy_single(
         try:
 
             log.info(
-                "COPY "
-                "source=%s "
+                "COPY source=%s "
                 "destination=%s "
                 "message=%s",
                 source_id,
@@ -1219,16 +1381,6 @@ async def copy_single(
                 ),
             )
 
-            log.info(
-                "COPY SUCCESS "
-                "source=%s "
-                "destination=%s "
-                "message=%s",
-                source_id,
-                destination_id,
-                message_id,
-            )
-
             return True
 
         except TelegramRetryAfter as exc:
@@ -1241,16 +1393,31 @@ async def copy_single(
             )
 
             log.warning(
-                "FloodWait %ss "
-                "source=%s "
+                "Flood wait %ss "
                 "destination=%s",
                 wait,
-                source_id,
                 destination_id,
             )
 
             await asyncio.sleep(
                 wait
+            )
+
+        except TelegramNetworkError as exc:
+
+            if attempt >= retries:
+
+                db["stats"][
+                    "last_error"
+                ] = str(exc)
+
+                return False
+
+            await asyncio.sleep(
+                min(
+                    2 ** attempt,
+                    30,
+                )
             )
 
         except TelegramForbiddenError as exc:
@@ -1260,10 +1427,7 @@ async def copy_single(
             ] = str(exc)
 
             log.error(
-                "Forbidden "
-                "source=%s "
-                "destination=%s: %s",
-                source_id,
+                "Forbidden destination=%s: %s",
                 destination_id,
                 exc,
             )
@@ -1277,8 +1441,7 @@ async def copy_single(
             ] = str(exc)
 
             log.error(
-                "Bad request "
-                "source=%s "
+                "BadRequest source=%s "
                 "destination=%s "
                 "message=%s: %s",
                 source_id,
@@ -1288,30 +1451,6 @@ async def copy_single(
             )
 
             return False
-
-        except TelegramNetworkError as exc:
-
-            if attempt >= retries:
-
-                db["stats"][
-                    "last_error"
-                ] = str(exc)
-
-                log.error(
-                    "Network error after retries: %s",
-                    exc,
-                )
-
-                return False
-
-            wait = min(
-                2 ** attempt,
-                30,
-            )
-
-            await asyncio.sleep(
-                wait
-            )
 
         except Exception as exc:
 
@@ -1347,7 +1486,7 @@ async def copy_album(
     message_ids: list[int],
 ) -> int:
 
-    sent = 0
+    total = 0
 
     for message_id in message_ids:
 
@@ -1359,7 +1498,7 @@ async def copy_album(
 
         if success:
 
-            sent += 1
+            total += 1
 
         await asyncio.sleep(
             float(
@@ -1369,14 +1508,134 @@ async def copy_album(
             )
         )
 
-    return sent
+    return total
 
 
 # ============================================================
-# ROUTE WORKER
+# SEND HISTORY ITEM
 # ============================================================
 
-async def route_worker(
+async def send_history_item(
+    source_id: str,
+    item: dict[str, Any],
+) -> int:
+
+    message_ids = [
+        int(x)
+        for x in item.get(
+            "message_ids",
+            [],
+        )
+    ]
+
+    if not message_ids:
+        return 0
+
+    destinations = list(
+        route_destinations(
+            source_id
+        )
+    )
+
+    if not destinations:
+        return 0
+
+    total_sent = 0
+
+    is_album = bool(
+        item.get(
+            "is_album",
+            False,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Every destination is independent.
+    # --------------------------------------------------------
+
+    for destination in destinations:
+
+        destination_id = str(
+            destination["id"]
+        )
+
+        try:
+
+            if is_album:
+
+                sent = await copy_album(
+                    source_id,
+                    destination_id,
+                    message_ids,
+                )
+
+                total_sent += sent
+
+                if sent < len(
+                    message_ids
+                ):
+
+                    db["stats"][
+                        "failed"
+                    ] += (
+                        len(message_ids)
+                        - sent
+                    )
+
+            else:
+
+                success = await copy_single(
+                    source_id,
+                    destination_id,
+                    message_ids[0],
+                )
+
+                if success:
+
+                    total_sent += 1
+
+                else:
+
+                    db["stats"][
+                        "failed"
+                    ] += 1
+
+        except Exception as exc:
+
+            db["stats"][
+                "failed"
+            ] += len(
+                message_ids
+            )
+
+            db["stats"][
+                "last_error"
+            ] = str(exc)
+
+            log.exception(
+                "Destination failed but "
+                "source cycle continues. "
+                "source=%s destination=%s",
+                source_id,
+                destination_id,
+            )
+
+        await asyncio.sleep(
+            float(
+                db["settings"][
+                    "interval"
+                ]
+            )
+        )
+
+    return total_sent
+
+
+# ============================================================
+# SOURCE WORKER
+# ============================================================
+
+async def source_worker(
     source_id: str,
 ):
 
@@ -1384,163 +1643,206 @@ async def route_worker(
         source_id
     )
 
-    queue = route_queues[
+    queue = source_queues[
         source_id
     ]
 
-    log.info(
-        "ROUTE WORKER STARTED "
-        "source=%s",
-        source_id,
-    )
-
     while True:
 
-        item = await queue.get()
-
         try:
+
+            # =================================================
+            # 1. PROCESS NEW POSTS FIRST
+            # =================================================
+
+            try:
+
+                item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=1.0,
+                )
+
+                try:
+
+                    sent = await send_history_item(
+                        source_id,
+                        item,
+                    )
+
+                    db["stats"][
+                        "sent"
+                    ] += sent
+
+                    if sent:
+
+                        db["stats"][
+                            "last_sent"
+                        ] = int(
+                            time.time()
+                        )
+
+                    await save_db()
+
+                finally:
+
+                    queue.task_done()
+
+                continue
+
+            except asyncio.TimeoutError:
+
+                pass
+
+            # =================================================
+            # 2. NO NEW POST IN QUEUE
+            # =================================================
 
             if not db["settings"][
                 "enabled"
             ]:
 
+                await asyncio.sleep(
+                    1
+                )
+
                 continue
 
-            destinations = list(
-                route_destinations(
+            if not db["settings"][
+                "cycle_enabled"
+            ]:
+
+                await asyncio.sleep(
+                    1
+                )
+
+                continue
+
+            history = get_history(
+                source_id
+            )
+
+            if not history:
+
+                # No saved post yet.
+                await asyncio.sleep(
+                    1
+                )
+
+                continue
+
+            # =================================================
+            # 3. WAIT BEFORE NEXT CYCLE
+            # =================================================
+
+            cycle_delay = float(
+                db["settings"][
+                    "cycle_delay"
+                ]
+            )
+
+            if cycle_delay > 0:
+
+                await asyncio.sleep(
+                    cycle_delay
+                )
+
+            # =================================================
+            # 4. CYCLE FROM FIRST POST
+            # =================================================
+
+            log.info(
+                "STARTING CYCLE "
+                "source=%s "
+                "history=%s",
+                source_id,
+                len(history),
+            )
+
+            db["stats"][
+                "cycles"
+            ] += 1
+
+            db["stats"][
+                "last_cycle"
+            ] = int(
+                time.time()
+            )
+
+            await save_db()
+
+            # -------------------------------------------------
+            # IMPORTANT:
+            #
+            # We make a snapshot.
+            #
+            # New posts arriving during this cycle
+            # will go into queue and will be processed
+            # before the next cycle.
+            # -------------------------------------------------
+
+            cycle_snapshot = list(
+                get_history(
                     source_id
                 )
             )
 
-            if not destinations:
+            for history_item in cycle_snapshot:
 
-                log.warning(
-                    "No destinations "
-                    "for source=%s",
-                    source_id,
-                )
+                # ---------------------------------------------
+                # If a new post arrives while cycling,
+                # stop current cycle and process the new
+                # post first.
+                # ---------------------------------------------
 
-                continue
+                if not queue.empty():
 
-            message_ids = item[
-                "message_ids"
-            ]
-
-            is_album = item[
-                "is_album"
-            ]
-
-            #
-            # IMPORTANT:
-            #
-            # Every destination is attempted
-            # independently.
-            #
-            # If A fails, B/C/D still get
-            # their copy attempt.
-            #
-
-            total_sent = 0
-
-            for destination in destinations:
-
-                destination_id = str(
-                    destination["id"]
-                )
-
-                try:
-
-                    if is_album:
-
-                        sent = await copy_album(
-                            source_id,
-                            destination_id,
-                            message_ids,
-                        )
-
-                        total_sent += sent
-
-                        if sent < len(
-                            message_ids
-                        ):
-
-                            db["stats"][
-                                "failed"
-                            ] += (
-                                len(
-                                    message_ids
-                                )
-                                - sent
-                            )
-
-                    else:
-
-                        success = await copy_single(
-                            source_id,
-                            destination_id,
-                            message_ids[0],
-                        )
-
-                        if success:
-
-                            total_sent += 1
-
-                        else:
-
-                            db["stats"][
-                                "failed"
-                            ] += 1
-
-                except Exception as exc:
-
-                    #
-                    # VERY IMPORTANT:
-                    #
-                    # A single destination
-                    # must NEVER kill the
-                    # route worker.
-                    #
-
-                    db["stats"][
-                        "last_error"
-                    ] = str(exc)
-
-                    db["stats"][
-                        "failed"
-                    ] += len(
-                        message_ids
-                    )
-
-                    log.exception(
-                        "Destination failed "
-                        "but route continues. "
-                        "source=%s "
-                        "destination=%s",
+                    log.info(
+                        "New posts waiting. "
+                        "Breaking cycle early. "
+                        "source=%s",
                         source_id,
-                        destination_id,
                     )
+
+                    break
+
+                if not db["settings"][
+                    "enabled"
+                ]:
+
+                    break
+
+                if not db["settings"][
+                    "cycle_enabled"
+                ]:
+
+                    break
+
+                sent = await send_history_item(
+                    source_id,
+                    history_item,
+                )
+
+                db["stats"][
+                    "sent"
+                ] += sent
+
+                if sent:
+
+                    db["stats"][
+                        "last_sent"
+                    ] = int(
+                        time.time()
+                    )
+
+                await save_db()
 
                 await asyncio.sleep(
                     float(
                         db["settings"][
-                            "interval"
+                            "cycle_interval"
                         ]
                     )
                 )
-
-            db["stats"][
-                "sent"
-            ] += total_sent
-
-            if total_sent:
-
-                db["stats"][
-                    "last_sent"
-                ] = int(
-                    time.time()
-                )
-
-            await save_db()
 
         except asyncio.CancelledError:
 
@@ -1548,19 +1850,14 @@ async def route_worker(
 
         except Exception as exc:
 
-            #
-            # Worker itself crashed:
-            # log it, sleep, then CONTINUE.
-            #
-
             db["stats"][
                 "last_error"
             ] = str(exc)
 
             log.exception(
-                "ROUTE WORKER ERROR "
+                "SOURCE WORKER ERROR "
                 "source=%s. "
-                "Worker continues.",
+                "Worker will continue.",
                 source_id,
             )
 
@@ -1568,16 +1865,12 @@ async def route_worker(
                 2
             )
 
-        finally:
-
-            queue.task_done()
-
 
 # ============================================================
 # QUEUE NEW POST
 # ============================================================
 
-async def queue_route(
+async def queue_new_post(
     source_id: str,
     message_ids: list[int],
     is_album: bool,
@@ -1587,34 +1880,24 @@ async def queue_route(
         source_id
     )
 
-    destinations = route_destinations(
+    if not route_destinations(
         source_id
-    )
-
-    if not destinations:
-
-        log.warning(
-            "No route destinations "
-            "source=%s",
-            source_id,
-        )
+    ):
 
         return
 
-    await start_route_worker(
+    await start_source_worker(
         source_id
     )
 
-    queue = route_queues[
+    queue = source_queues[
         source_id
     ]
 
     item = {
-        "source_id": source_id,
-
         "message_ids": [
-            int(message_id)
-            for message_id in message_ids
+            int(x)
+            for x in message_ids
         ],
 
         "is_album": bool(
@@ -1626,57 +1909,38 @@ async def queue_route(
         ),
     }
 
-    try:
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # put(), NOT put_nowait().
+    #
+    # This prevents QueueFull from silently dropping
+    # a post.
+    # --------------------------------------------------------
 
-        queue.put_nowait(
-            item
-        )
+    await queue.put(
+        item
+    )
 
-        db["stats"][
-            "queued"
-        ] += len(
-            message_ids
-        )
+    db["stats"][
+        "queued"
+    ] += len(
+        message_ids
+    )
 
-        log.info(
-            "QUEUED "
-            "source=%s "
-            "messages=%s "
-            "destinations=%s",
-            source_id,
-            message_ids,
-            len(
-                destinations
-            ),
-        )
+    log.info(
+        "NEW POST QUEUED "
+        "source=%s "
+        "messages=%s",
+        source_id,
+        message_ids,
+    )
 
-        await save_db()
-
-    except asyncio.QueueFull:
-
-        db["stats"][
-            "failed"
-        ] += len(
-            message_ids
-        )
-
-        db["stats"][
-            "last_error"
-        ] = (
-            "Route queue full "
-            + source_id
-        )
-
-        log.error(
-            "QUEUE FULL source=%s",
-            source_id,
-        )
-
-        await save_db()
+    await save_db()
 
 
 # ============================================================
-# ALBUM HANDLING
+# ALBUM FLUSH
 # ============================================================
 
 async def flush_album(
@@ -1705,7 +1969,6 @@ async def flush_album(
         )
 
         if not message_ids:
-
             return
 
         message_ids = sorted(
@@ -1714,11 +1977,21 @@ async def flush_album(
             )
         )
 
+        # ----------------------------------------------------
+        # SAVE ALBUM PERMANENTLY
+        # ----------------------------------------------------
+
+        await add_history(
+            source_id,
+            message_ids,
+            True,
+        )
+
         db["stats"][
             "albums"
         ] += 1
 
-        await queue_route(
+        await queue_new_post(
             source_id,
             message_ids,
             True,
@@ -1747,7 +2020,7 @@ async def flush_album(
 
 
 # ============================================================
-# NEW CHANNEL POST
+# CHANNEL POST
 # ============================================================
 
 @router.channel_post()
@@ -1765,29 +2038,18 @@ async def channel_post_handler(
 
     log.info(
         "NEW CHANNEL POST "
-        "source=%s "
-        "message=%s",
+        "source=%s message=%s",
         source_id,
         message_id,
     )
 
-    #
+    # --------------------------------------------------------
     # Only configured sources.
-    #
+    # --------------------------------------------------------
 
     if source_id not in source_ids():
 
-        log.info(
-            "Ignoring unconfigured "
-            "source=%s",
-            source_id,
-        )
-
         return
-
-    #
-    # Bot stopped.
-    #
 
     if not db["settings"][
         "enabled"
@@ -1795,29 +2057,18 @@ async def channel_post_handler(
 
         return
 
-    #
-    # No route.
-    #
-
     if not route_destinations(
         source_id
     ):
 
-        log.warning(
-            "Source has no destinations "
-            "source=%s",
-            source_id,
-        )
-
         return
 
-    #
+    # --------------------------------------------------------
     # DEDUPE
-    #
+    # --------------------------------------------------------
 
     dedupe_key = (
-        f"{source_id}:"
-        f"{message_id}"
+        f"{source_id}:{message_id}"
     )
 
     async with seen_lock:
@@ -1839,18 +2090,15 @@ async def channel_post_handler(
             time.time()
         )
 
-        #
-        # Keep JSON small.
-        #
-
+        # Keep seen DB small.
         if len(
             db["seen"]
-        ) > 20000:
+        ) > 50000:
 
             oldest = sorted(
                 db["seen"].items(),
-                key=lambda item: item[1],
-            )[:5000]
+                key=lambda x: x[1],
+            )[:10000]
 
             for key, _ in oldest:
 
@@ -1859,9 +2107,9 @@ async def channel_post_handler(
                     None
                 )
 
-    #
+    # --------------------------------------------------------
     # STATS
-    #
+    # --------------------------------------------------------
 
     db["stats"][
         "received"
@@ -1873,11 +2121,9 @@ async def channel_post_handler(
         time.time()
     )
 
-    await save_db()
-
-    #
+    # --------------------------------------------------------
     # ALBUM
-    #
+    # --------------------------------------------------------
 
     media_group_id = (
         message.media_group_id
@@ -1887,9 +2133,7 @@ async def channel_post_handler(
 
         album_key = (
             source_id,
-            str(
-                media_group_id
-            ),
+            str(media_group_id),
         )
 
         album_buffer[
@@ -1911,27 +2155,33 @@ async def channel_post_handler(
         ] = asyncio.create_task(
             flush_album(
                 source_id,
-                str(
-                    media_group_id
-                ),
+                str(media_group_id),
             )
         )
 
-    #
+        await save_db()
+
+        return
+
+    # --------------------------------------------------------
     # NORMAL POST
-    #
+    # --------------------------------------------------------
 
-    else:
+    await add_history(
+        source_id,
+        [message_id],
+        False,
+    )
 
-        await queue_route(
-            source_id,
-            [message_id],
-            False,
-        )
+    await queue_new_post(
+        source_id,
+        [message_id],
+        False,
+    )
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 @router.message(
@@ -1961,7 +2211,7 @@ async def start_handler(
 
 
 # ============================================================
-# /ADMIN
+# ADMIN
 # ============================================================
 
 @router.message(
@@ -1991,7 +2241,7 @@ async def admin_handler(
 
 
 # ============================================================
-# /CANCEL
+# CANCEL
 # ============================================================
 
 @router.message(
@@ -2015,7 +2265,7 @@ async def cancel_handler(
 
 
 # ============================================================
-# CALLBACK HANDLER
+# CALLBACKS
 # ============================================================
 
 @router.callback_query()
@@ -2035,15 +2285,11 @@ async def callback_handler(
 
         return
 
-    data = (
-        query.data
-        or ""
-    )
+    data = query.data or ""
 
     await query.answer()
 
     if not query.message:
-
         return
 
     # ========================================================
@@ -2062,7 +2308,7 @@ async def callback_handler(
         return
 
     # ========================================================
-    # TOGGLE
+    # TOGGLE RUNNING
     # ========================================================
 
     if data == "toggle":
@@ -2079,13 +2325,34 @@ async def callback_handler(
             "enabled"
         ]:
 
-            await ensure_route_workers()
+            await ensure_workers()
 
         else:
 
             log.info(
-                "Bot stopped."
+                "Bot stopped accepting new posts."
             )
+
+        await query.message.edit_text(
+            home_text(),
+            reply_markup=home_keyboard(),
+        )
+
+        return
+
+    # ========================================================
+    # CYCLE TOGGLE
+    # ========================================================
+
+    if data == "cycle_toggle":
+
+        db["settings"][
+            "cycle_enabled"
+        ] = not db["settings"][
+            "cycle_enabled"
+        ]
+
+        await save_db()
 
         await query.message.edit_text(
             home_text(),
@@ -2128,9 +2395,15 @@ async def callback_handler(
                     )
                 )
 
+                history = history_count(
+                    sid
+                )
+
                 text += (
                     f"{index}. "
                     f"<b>{display_name(source)}</b>\n"
+                    f"   ♻️ Saved posts: "
+                    f"<b>{history}</b>\n"
                 )
 
                 if destinations:
@@ -2145,8 +2418,8 @@ async def callback_handler(
                 else:
 
                     text += (
-                        "   └ "
-                        "⚠️ No destination\n"
+                        "   └ ⚠️ "
+                        "No destination\n"
                     )
 
                 text += "\n"
@@ -2187,10 +2460,8 @@ async def callback_handler(
             source["id"]
         )
 
-        selected = (
-            route_destination_ids(
-                source_id
-            )
+        selected = route_destination_ids(
+            source_id
         )
 
         text = (
@@ -2200,11 +2471,13 @@ async def callback_handler(
             f"<b>{display_name(source)}</b>\n"
             f"<code>{source_id}</code>\n\n"
 
+            f"Saved posts: "
+            f"<b>{history_count(source_id)}</b>\n"
+
             f"Selected destinations: "
             f"<b>{len(selected)}</b>\n\n"
 
-            "Tap a destination to "
-            "enable/disable this route."
+            "Tap destinations to enable/disable."
         )
 
         await query.message.edit_text(
@@ -2217,7 +2490,7 @@ async def callback_handler(
         return
 
     # ========================================================
-    # ROUTE DESTINATION TOGGLE
+    # ROUTE DESTINATION
     # ========================================================
 
     if data.startswith(
@@ -2246,7 +2519,6 @@ async def callback_handler(
         )
 
         if source_id not in source_ids():
-
             return
 
         destination_id = str(
@@ -2258,7 +2530,6 @@ async def callback_handler(
         )
 
         if source is None:
-
             return
 
         route = db[
@@ -2306,7 +2577,7 @@ async def callback_handler(
 
         await save_db()
 
-        await ensure_route_workers()
+        await ensure_workers()
 
         await query.message.edit_reply_markup(
             reply_markup=route_keyboard(
@@ -2315,16 +2586,13 @@ async def callback_handler(
         )
 
         await query.answer(
-            (
-                f"{display_name(destination)} "
-                f"{action}"
-            )
+            f"{display_name(destination)} {action}"
         )
 
         return
 
     # ========================================================
-    # ALL DESTINATIONS
+    # DESTINATIONS
     # ========================================================
 
     if data == "destinations":
@@ -2354,9 +2622,7 @@ async def callback_handler(
 
                 used_by = sum(
                     1
-                    for source in db[
-                        "sources"
-                    ]
+                    for source in db["sources"]
                     if did
                     in route_destination_ids(
                         str(
@@ -2398,11 +2664,8 @@ async def callback_handler(
             "or\n"
             "<code>-1001234567890</code>\n\n"
 
-            "⚠️ Bot must be administrator "
-            "in the source channel.\n\n"
-
-            "After adding, select the "
-            "destination channels for this source."
+            "Bot must be administrator "
+            "in source channel."
         )
 
         return
@@ -2420,20 +2683,16 @@ async def callback_handler(
         await query.message.edit_text(
             "📤 <b>Add Destination Channel</b>\n\n"
 
-            "Send channel username or ID:\n\n"
+            "Send @username or channel ID.\n\n"
 
-            "<code>@channelusername</code>\n"
-            "or\n"
-            "<code>-1001234567890</code>\n\n"
-
-            "⚠️ Bot must be administrator "
+            "Bot must be administrator "
             "with Post Messages permission."
         )
 
         return
 
     # ========================================================
-    # ADD DESTINATION DIRECTLY TO ROUTE
+    # ADD DESTINATION TO ROUTE
     # ========================================================
 
     if data.startswith(
@@ -2446,7 +2705,6 @@ async def callback_handler(
         )[1]
 
         if source_id not in source_ids():
-
             return
 
         await state.update_data(
@@ -2459,11 +2717,44 @@ async def callback_handler(
 
         await query.message.edit_text(
             "📤 <b>Add Destination</b>\n\n"
-
             "Send @username or channel ID.\n\n"
+            "It will be connected only "
+            "to this source."
+        )
 
-            "It will automatically be "
-            "connected to this source."
+        return
+
+    # ========================================================
+    # CLEAR HISTORY
+    # ========================================================
+
+    if data.startswith(
+        "clear_history:"
+    ):
+
+        source_id = data.split(
+            ":",
+            1,
+        )[1]
+
+        if source_id not in source_ids():
+            return
+
+        db["history"][
+            source_id
+        ] = []
+
+        await save_db()
+
+        await query.message.edit_text(
+            (
+                "🗑 <b>History Cleared</b>\n\n"
+                "Future NEW posts will again be "
+                "saved and used for cycling."
+            ),
+            reply_markup=route_keyboard(
+                source_id
+            ),
         )
 
         return
@@ -2485,9 +2776,7 @@ async def callback_handler(
 
             db["sources"] = [
                 source
-                for source in db[
-                    "sources"
-                ]
+                for source in db["sources"]
                 if str(
                     source["id"]
                 ) != source_id
@@ -2498,7 +2787,12 @@ async def callback_handler(
                 None,
             )
 
-            await stop_route_worker(
+            db["history"].pop(
+                source_id,
+                None,
+            )
+
+            await stop_source_worker(
                 source_id
             )
 
@@ -2510,9 +2804,7 @@ async def callback_handler(
             db["seen"] = {
                 key: value
                 for key, value
-                in db[
-                    "seen"
-                ].items()
+                in db["seen"].items()
                 if not key.startswith(
                     prefix
                 )
@@ -2558,11 +2850,6 @@ async def callback_handler(
             destination["id"]
         )
 
-        #
-        # Remove this destination
-        # from EVERY route.
-        #
-
         for route in db[
             "routes"
         ].values():
@@ -2582,7 +2869,7 @@ async def callback_handler(
 
         await save_db()
 
-        await ensure_route_workers()
+        await ensure_workers()
 
         await query.message.edit_text(
             "📤 <b>Destination Channels</b>",
@@ -2614,7 +2901,7 @@ async def callback_handler(
             "stats"
         ]
 
-        queue_lines = []
+        lines = []
 
         for source in db[
             "sources"
@@ -2624,23 +2911,31 @@ async def callback_handler(
                 source["id"]
             )
 
-            queue = route_queues.get(
+            queue = source_queues.get(
                 sid
             )
 
-            if queue:
-
-                queue_lines.append(
-                    f"• "
-                    f"{display_name(source)}: "
-                    f"<b>{queue.qsize()}</b>"
-                )
-
-        queue_text = (
-            "\n".join(
-                queue_lines
+            qsize = (
+                queue.qsize()
+                if queue
+                else 0
             )
-            if queue_lines
+
+            history = history_count(
+                sid
+            )
+
+            lines.append(
+                (
+                    f"• <b>{display_name(source)}</b>\n"
+                    f"  Queue: <b>{qsize}</b> | "
+                    f"History: <b>{history}</b>"
+                )
+            )
+
+        route_text = (
+            "\n".join(lines)
+            if lines
             else "-"
         )
 
@@ -2650,14 +2945,14 @@ async def callback_handler(
             f"Running: "
             f"<b>{db['settings']['enabled']}</b>\n"
 
-            f"Route workers: "
-            f"<b>{len(route_tasks)}</b>\n\n"
+            f"Cycle: "
+            f"<b>{db['settings']['cycle_enabled']}</b>\n"
+
+            f"Workers: "
+            f"<b>{len(source_tasks)}</b>\n\n"
 
             f"📥 Received: "
             f"<b>{stats['received']}</b>\n"
-
-            f"📦 Queued: "
-            f"<b>{stats['queued']}</b>\n"
 
             f"📤 Sent: "
             f"<b>{stats['sent']}</b>\n"
@@ -2665,11 +2960,11 @@ async def callback_handler(
             f"❌ Failed: "
             f"<b>{stats['failed']}</b>\n"
 
-            f"🖼 Albums: "
-            f"<b>{stats['albums']}</b>\n\n"
+            f"♻️ Cycles: "
+            f"<b>{stats['cycles']}</b>\n\n"
 
-            "<b>Route Queues</b>\n"
-            f"{queue_text}\n\n"
+            "<b>Source Queues</b>\n"
+            f"{route_text}\n\n"
 
             "<b>Last Error</b>\n"
             f"<code>"
@@ -2694,7 +2989,7 @@ async def callback_handler(
         return
 
     # ========================================================
-    # SET INTERVAL
+    # COPY INTERVAL
     # ========================================================
 
     if data == "setting:interval":
@@ -2704,20 +2999,34 @@ async def callback_handler(
         )
 
         await query.message.edit_text(
-            "⏱ <b>Set Copy Interval</b>\n\n"
-
+            "⏱ <b>Copy Interval</b>\n\n"
             "Enter seconds.\n\n"
-
-            "Example:\n"
-            "<code>1</code>\n\n"
-
-            "Recommended: 1–3 seconds."
+            "Example: <code>1</code>"
         )
 
         return
 
     # ========================================================
-    # SET ALBUM WAIT
+    # CYCLE DELAY
+    # ========================================================
+
+    if data == "setting:cycle_delay":
+
+        await state.set_state(
+            SetCycleDelay.value
+        )
+
+        await query.message.edit_text(
+            "🔄 <b>Cycle Delay</b>\n\n"
+            "Time before starting from "
+            "the first saved post again.\n\n"
+            "Example: <code>5</code>"
+        )
+
+        return
+
+    # ========================================================
+    # ALBUM WAIT
     # ========================================================
 
     if data == "setting:album":
@@ -2728,17 +3037,14 @@ async def callback_handler(
 
         await query.message.edit_text(
             "📦 <b>Album Wait</b>\n\n"
-
             "Enter seconds.\n\n"
-
-            "Example:\n"
-            "<code>1.5</code>"
+            "Example: <code>1.5</code>"
         )
 
         return
 
     # ========================================================
-    # SET RETRIES
+    # RETRIES
     # ========================================================
 
     if data == "setting:retries":
@@ -2749,17 +3055,13 @@ async def callback_handler(
 
         await query.message.edit_text(
             "🔁 <b>Retries</b>\n\n"
-
-            "Enter 0–20.\n\n"
-
-            "Example:\n"
-            "<code>5</code>"
+            "Enter 0–20."
         )
 
         return
 
     # ========================================================
-    # SET QUEUE
+    # QUEUE
     # ========================================================
 
     if data == "setting:queue":
@@ -2770,18 +3072,14 @@ async def callback_handler(
 
         await query.message.edit_text(
             "📚 <b>Queue Limit</b>\n\n"
-
-            "Enter 100–50000.\n\n"
-
-            "Example:\n"
-            "<code>10000</code>"
+            "Enter 100–50000."
         )
 
         return
 
 
 # ============================================================
-# ADD SOURCE MESSAGE
+# ADD SOURCE
 # ============================================================
 
 @router.message(
@@ -2792,21 +3090,17 @@ async def add_source_handler(
     state: FSMContext,
 ):
 
-    if not is_admin(
-        message
-    ):
-
+    if not is_admin(message):
         return
 
     value = (
-        message.text
-        or ""
+        message.text or ""
     ).strip()
 
     if not value:
 
         await message.answer(
-            "❌ Send a channel username or ID."
+            "❌ Send channel username or ID."
         )
 
         return
@@ -2824,37 +3118,38 @@ async def add_source_handler(
         if source_id in source_ids():
 
             await message.answer(
-                "⚠️ Source already exists.",
+                "⚠️ Source already exists."
             )
 
         else:
 
-            db[
-                "sources"
-            ].append(
+            db["sources"].append(
                 source
             )
 
-            db[
-                "routes"
-            ][source_id] = {
+            db["routes"][
+                source_id
+            ] = {
                 "source": source,
                 "destinations": [],
             }
+
+            db["history"].setdefault(
+                source_id,
+                [],
+            )
 
             await save_db()
 
             await message.answer(
                 (
                     "✅ <b>Source Added</b>\n\n"
-
-                    f"Source:\n"
                     f"<b>{display_name(source)}</b>\n"
                     f"<code>{source_id}</code>\n\n"
-
-                    "📡 Only NEW posts will be monitored.\n\n"
-
-                    "Now select destination channels."
+                    "📡 Bot will monitor NEW posts.\n"
+                    "♻️ Received posts are saved for "
+                    "automatic cycling.\n\n"
+                    "Now select destinations."
                 ),
                 reply_markup=route_keyboard(
                     source_id
@@ -2880,7 +3175,7 @@ async def add_source_handler(
 
 
 # ============================================================
-# ADD DESTINATION MESSAGE
+# ADD DESTINATION
 # ============================================================
 
 @router.message(
@@ -2891,31 +3186,25 @@ async def add_destination_handler(
     state: FSMContext,
 ):
 
-    if not is_admin(
-        message
-    ):
-
+    if not is_admin(message):
         return
 
     value = (
-        message.text
-        or ""
+        message.text or ""
     ).strip()
 
     if not value:
 
         await message.answer(
-            "❌ Send a channel username or ID."
+            "❌ Send channel username or ID."
         )
 
         return
 
     state_data = await state.get_data()
 
-    route_source_id = (
-        state_data.get(
-            "route_source_id"
-        )
+    route_source_id = state_data.get(
+        "route_source_id"
     )
 
     try:
@@ -2932,11 +3221,6 @@ async def add_destination_handler(
             destination_id
         )
 
-        #
-        # Add to global destination
-        # registry only if new.
-        #
-
         if destination_id not in destination_ids():
 
             db[
@@ -2945,15 +3229,9 @@ async def add_destination_handler(
                 destination
             )
 
-        #
-        # If opened from a route,
-        # connect destination directly.
-        #
-
         if (
             route_source_id
-            and route_source_id
-            in source_ids()
+            and route_source_id in source_ids()
         ):
 
             source = get_source(
@@ -2987,21 +3265,19 @@ async def add_destination_handler(
 
             await save_db()
 
-            await start_route_worker(
+            await start_source_worker(
                 route_source_id
             )
 
             await message.answer(
                 (
                     "✅ <b>Destination Added</b>\n\n"
-
                     f"Source:\n"
                     f"<b>{display_name(source)}</b>\n\n"
-
                     f"Destination:\n"
                     f"<b>{display_name(destination)}</b>\n\n"
-
-                    "🚀 Route is active."
+                    "🚀 Route active.\n"
+                    "♻️ Cycling enabled."
                 ),
                 reply_markup=route_keyboard(
                     route_source_id
@@ -3016,8 +3292,8 @@ async def add_destination_handler(
                 (
                     "✅ <b>Destination Added</b>\n\n"
                     f"<b>{display_name(destination)}</b>\n\n"
-                    "Go to Routes and select "
-                    "which sources should send here."
+                    "Open Routes and select "
+                    "the source(s)."
                 ),
                 reply_markup=destinations_keyboard(),
             )
@@ -3056,30 +3332,75 @@ async def set_interval_handler(
 
         value = float(
             (
-                message.text
-                or ""
+                message.text or ""
             ).strip()
         )
 
         if not (
-            0.1
-            <= value
-            <= 3600
+            0.1 <= value <= 3600
         ):
 
             raise ValueError
 
-        db[
-            "settings"
-        ][
+        db["settings"][
             "interval"
         ] = value
 
         await save_db()
 
         await message.answer(
+            f"✅ Copy interval: <b>{value}s</b>",
+            reply_markup=settings_keyboard(),
+        )
+
+    except ValueError:
+
+        await message.answer(
+            "❌ Enter 0.1–3600."
+        )
+
+        return
+
+    finally:
+
+        await state.clear()
+
+
+# ============================================================
+# SET CYCLE DELAY
+# ============================================================
+
+@router.message(
+    SetCycleDelay.value
+)
+async def set_cycle_delay_handler(
+    message: Message,
+    state: FSMContext,
+):
+
+    try:
+
+        value = float(
             (
-                f"✅ Interval set to "
+                message.text or ""
+            ).strip()
+        )
+
+        if not (
+            0 <= value <= 86400
+        ):
+
+            raise ValueError
+
+        db["settings"][
+            "cycle_delay"
+        ] = value
+
+        await save_db()
+
+        await message.answer(
+            (
+                f"✅ Cycle delay set to "
                 f"<b>{value}s</b>."
             ),
             reply_markup=settings_keyboard(),
@@ -3088,7 +3409,7 @@ async def set_interval_handler(
     except ValueError:
 
         await message.answer(
-            "❌ Enter a number between 0.1 and 3600."
+            "❌ Enter 0–86400."
         )
 
         return
@@ -3114,22 +3435,17 @@ async def set_album_wait_handler(
 
         value = float(
             (
-                message.text
-                or ""
+                message.text or ""
             ).strip()
         )
 
         if not (
-            0.2
-            <= value
-            <= 10
+            0.2 <= value <= 10
         ):
 
             raise ValueError
 
-        db[
-            "settings"
-        ][
+        db["settings"][
             "album_wait"
         ] = value
 
@@ -3137,8 +3453,8 @@ async def set_album_wait_handler(
 
         await message.answer(
             (
-                f"✅ Album wait set to "
-                f"<b>{value}s</b>."
+                f"✅ Album wait: "
+                f"<b>{value}s</b>"
             ),
             reply_markup=settings_keyboard(),
         )
@@ -3146,7 +3462,7 @@ async def set_album_wait_handler(
     except ValueError:
 
         await message.answer(
-            "❌ Enter a number between 0.2 and 10."
+            "❌ Enter 0.2–10."
         )
 
         return
@@ -3172,22 +3488,17 @@ async def set_retries_handler(
 
         value = int(
             (
-                message.text
-                or ""
+                message.text or ""
             ).strip()
         )
 
         if not (
-            0
-            <= value
-            <= 20
+            0 <= value <= 20
         ):
 
             raise ValueError
 
-        db[
-            "settings"
-        ][
+        db["settings"][
             "retries"
         ] = value
 
@@ -3201,7 +3512,7 @@ async def set_retries_handler(
     except ValueError:
 
         await message.answer(
-            "❌ Enter an integer from 0 to 20."
+            "❌ Enter 0–20."
         )
 
         return
@@ -3227,39 +3538,26 @@ async def set_queue_handler(
 
         value = int(
             (
-                message.text
-                or ""
+                message.text or ""
             ).strip()
         )
 
         if not (
-            100
-            <= value
-            <= 50000
+            100 <= value <= 50000
         ):
 
             raise ValueError
 
-        db[
-            "settings"
-        ][
+        db["settings"][
             "max_queue"
         ] = value
 
         await save_db()
 
-        #
-        # Existing queues are intentionally
-        # not destroyed because that would
-        # delete pending posts.
-        #
-        # New queues will use the new size.
-        #
-
         await message.answer(
             (
                 "✅ Queue limit updated.\n\n"
-                "Existing pending queues were preserved."
+                "Existing queues are preserved."
             ),
             reply_markup=settings_keyboard(),
         )
@@ -3267,7 +3565,7 @@ async def set_queue_handler(
     except ValueError:
 
         await message.answer(
-            "❌ Enter an integer from 100 to 50000."
+            "❌ Enter 100–50000."
         )
 
         return
@@ -3285,50 +3583,46 @@ async def health_handler(
     request: web.Request,
 ):
 
+    stats = db["stats"]
+
     return web.json_response(
         {
             "ok": True,
-
             "mode": "webhook",
-
             "running": bool(
-                db["settings"][
-                    "enabled"
-                ]
+                db["settings"]["enabled"]
             ),
-
+            "cycle": bool(
+                db["settings"]["cycle_enabled"]
+            ),
             "sources": len(
                 db["sources"]
             ),
-
             "destinations": len(
                 db["destinations"]
             ),
-
             "routes": route_count(),
-
             "workers": len(
-                route_tasks
+                source_tasks
             ),
-
-            "received": db[
-                "stats"
-            ][
+            "history": sum(
+                history_count(
+                    str(source["id"])
+                )
+                for source in db["sources"]
+            ),
+            "received": stats[
                 "received"
             ],
-
-            "sent": db[
-                "stats"
-            ][
+            "sent": stats[
                 "sent"
             ],
-
-            "failed": db[
-                "stats"
-            ][
+            "failed": stats[
                 "failed"
             ],
-
+            "cycles": stats[
+                "cycles"
+            ],
             "time": int(
                 time.time()
             ),
@@ -3346,10 +3640,6 @@ async def telegram_webhook(
 
     try:
 
-        #
-        # Verify Telegram secret.
-        #
-
         incoming_secret = (
             request.headers.get(
                 "X-Telegram-Bot-Api-Secret-Token",
@@ -3357,7 +3647,10 @@ async def telegram_webhook(
             )
         )
 
-        if incoming_secret != WEBHOOK_SECRET:
+        if not secrets.compare_digest(
+            incoming_secret,
+            WEBHOOK_SECRET,
+        ):
 
             log.warning(
                 "Invalid webhook secret."
@@ -3402,7 +3695,7 @@ async def telegram_webhook(
             text="OK"
         )
 
-    except Exception as exc:
+    except Exception:
 
         log.exception(
             "Webhook update error."
@@ -3459,20 +3752,18 @@ async def start_web_server():
     await site.start()
 
     log.info(
-        "HTTP server started "
-        "port=%s",
+        "HTTP server started port=%s",
         PORT,
     )
 
 
 # ============================================================
-# SET TELEGRAM WEBHOOK
+# WEBHOOK SETUP
 # ============================================================
 
 async def setup_webhook():
 
     if bot is None:
-
         return
 
     webhook_url = (
@@ -3481,29 +3772,21 @@ async def setup_webhook():
     )
 
     log.info(
-        "Setting webhook: %s",
-        webhook_url,
+        "Setting webhook."
     )
 
     await bot.set_webhook(
         url=webhook_url,
-
-        secret_token=(
-            WEBHOOK_SECRET
-        ),
-
+        secret_token=WEBHOOK_SECRET,
         allowed_updates=[
             "message",
             "callback_query",
             "channel_post",
         ],
-
         drop_pending_updates=False,
     )
 
-    info = (
-        await bot.get_webhook_info()
-    )
+    info = await bot.get_webhook_info()
 
     log.info(
         "Webhook active: %s",
@@ -3513,14 +3796,14 @@ async def setup_webhook():
     if info.last_error_message:
 
         log.error(
-            "Telegram webhook error: %s",
+            "Webhook error: %s",
             info.last_error_message,
         )
 
-        log.error(
-            "Webhook pending updates: %s",
-            info.pending_update_count,
-        )
+    log.info(
+        "Pending Telegram updates: %s",
+        info.pending_update_count,
+    )
 
 
 # ============================================================
@@ -3529,9 +3812,9 @@ async def setup_webhook():
 
 async def shutdown():
 
-    #
-    # Cancel album timers.
-    #
+    # --------------------------------------------------------
+    # Album timers
+    # --------------------------------------------------------
 
     for task in list(
         album_tasks.values()
@@ -3553,21 +3836,21 @@ async def shutdown():
 
     album_tasks.clear()
 
-    #
-    # Stop route workers.
-    #
+    # --------------------------------------------------------
+    # Workers
+    # --------------------------------------------------------
 
     for source_id in list(
-        route_tasks
+        source_tasks
     ):
 
-        await stop_route_worker(
+        await stop_source_worker(
             source_id
         )
 
-    #
-    # Web server.
-    #
+    # --------------------------------------------------------
+    # Web server
+    # --------------------------------------------------------
 
     if server_runner:
 
@@ -3585,7 +3868,6 @@ async def main():
 
     bot = Bot(
         token=BOT_TOKEN,
-
         default=DefaultBotProperties(
             parse_mode=ParseMode.HTML
         ),
@@ -3600,8 +3882,7 @@ async def main():
     me = await bot.get_me()
 
     log.info(
-        "Bot connected "
-        "@%s | ID=%s",
+        "Bot connected @%s | ID=%s",
         me.username,
         me.id,
     )
@@ -3610,7 +3891,7 @@ async def main():
 
     await setup_webhook()
 
-    await ensure_route_workers()
+    await ensure_workers()
 
     log.info(
         "=========================================="
@@ -3621,19 +3902,15 @@ async def main():
     )
 
     log.info(
-        "ROUTE MODE ENABLED"
+        "NEW POSTS ARE SAVED"
     )
 
     log.info(
-        "NEW POSTS ONLY"
+        "AUTOMATIC CYCLING ENABLED"
     )
 
     log.info(
-        "NO OLD HISTORY SCAN"
-    )
-
-    log.info(
-        "NO API ID / API HASH"
+        "FIRST POST -> LAST POST -> FIRST POST"
     )
 
     log.info(
@@ -3641,14 +3918,18 @@ async def main():
     )
 
     log.info(
+        "ROUTE BASED DESTINATIONS"
+    )
+
+    log.info(
+        "NO API ID / API HASH"
+    )
+
+    log.info(
         "=========================================="
     )
 
     try:
-
-        #
-        # Keep Render process alive forever.
-        #
 
         await asyncio.Event().wait()
 
