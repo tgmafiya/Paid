@@ -32,24 +32,41 @@ from aiogram.types import (
     Update,
 )
 
-load_dotenv()
+# ============================================================
+# ENV
+# ============================================================
 
-# ============================================================
-# CONFIG
-# ============================================================
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
-DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
-RENDER_URL = os.getenv("RENDER_URL", "").strip().rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
+PORT_RAW = os.getenv("PORT", "10000").strip()
+DATA_FILE = Path(
+    os.getenv("DATA_FILE", "data.json").strip()
+)
+
+RENDER_URL = (
+    os.getenv("RENDER_URL", "")
+    .strip()
+    .rstrip("/")
+)
+
+WEBHOOK_SECRET = (
+    os.getenv("WEBHOOK_SECRET", "")
+    .strip()
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
 
 if not ADMIN_ID_RAW.lstrip("-").isdigit():
     raise RuntimeError("ADMIN_ID must be numeric.")
+
+try:
+    PORT = int(PORT_RAW)
+except ValueError:
+    raise RuntimeError("PORT must be numeric.")
 
 if not RENDER_URL:
     raise RuntimeError("RENDER_URL is missing.")
@@ -58,11 +75,15 @@ if not WEBHOOK_SECRET:
     raise RuntimeError("WEBHOOK_SECRET is missing.")
 
 if WEBHOOK_SECRET == BOT_TOKEN:
-    raise RuntimeError("WEBHOOK_SECRET must NOT be the BOT_TOKEN.")
+    raise RuntimeError(
+        "WEBHOOK_SECRET must NOT be the BOT_TOKEN."
+    )
 
 ADMIN_ID = int(ADMIN_ID_RAW)
 
-WEBHOOK_PATH = f"/telegram/webhook/{WEBHOOK_SECRET}"
+WEBHOOK_PATH = (
+    f"/telegram/webhook/{WEBHOOK_SECRET}"
+)
 
 # ============================================================
 # LOGGING
@@ -70,33 +91,48 @@ WEBHOOK_PATH = f"/telegram/webhook/{WEBHOOK_SECRET}"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
 )
 
-log = logging.getLogger("repeat-route-bot")
+log = logging.getLogger("route-repeat-bot")
 
 # ============================================================
-# DEFAULT DATABASE
+# ROUTER
 # ============================================================
 
-DEFAULT_SETTINGS = {
+# IMPORTANT:
+# This was missing in your previous code.
+router = Router()
+
+# ============================================================
+# DEFAULT SETTINGS
+# ============================================================
+
+DEFAULT_SETTINGS: dict[str, Any] = {
     "enabled": True,
-
-    # Repeat mode.
     "repeat_enabled": True,
 
-    # Seconds between copied posts.
-    "interval": 1.0,
+    # Seconds between playlist items.
+    "interval": 10.0,
 
-    # Retry count.
+    # Retry attempts.
     "retries": 8,
 
-    # Album grouping delay.
+    # Album collection delay.
     "album_wait": 1.5,
 
-    # Maximum stored playlist items per source.
+    # Maximum playlist entries per source.
     "max_playlist": 50000,
 }
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 
 def fresh_db() -> dict[str, Any]:
@@ -108,30 +144,39 @@ def fresh_db() -> dict[str, Any]:
         "destinations": [],
 
         # source_id -> {
-        #   source: {...},
-        #   destinations: [...]
+        #     source: {...},
+        #     destinations: [...]
         # }
         "routes": {},
 
-        # source_id -> playlist
-        #
-        # Each playlist item:
-        #
-        # {
-        #   "id": 123,
-        #   "ids": [123],
-        #   "album": false,
-        #   "created": 1234567890
-        # }
-        #
+        # source_id -> [
+        #     {
+        #         "id": 123,
+        #         "ids": [123],
+        #         "album": false,
+        #         "created": 1234567890
+        #     }
+        # ]
         "playlists": {},
 
-        # source_id -> current index
+        # IMPORTANT:
+        #
+        # Position is now stored per:
+        #
+        # source_id|destination_id
+        #
+        # Example:
+        #
+        # "-100111|-100222": 0
+        #
+        # "-100111|-100333": 0
+        #
+        # This prevents destination workers
+        # from interfering with each other.
         "positions": {},
 
         "stats": {
             "received": 0,
-            "enqueued": 0,
             "sent": 0,
             "failed": 0,
             "albums": 0,
@@ -144,23 +189,30 @@ def fresh_db() -> dict[str, Any]:
 
 
 def load_db() -> dict[str, Any]:
+
     if not DATA_FILE.exists():
         return fresh_db()
 
     try:
-        raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(
+            DATA_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
 
         if not isinstance(raw, dict):
             return fresh_db()
 
     except Exception:
-        log.exception("Could not read data.json")
+        log.exception(
+            "Could not load data.json"
+        )
         return fresh_db()
 
     db = fresh_db()
 
     # --------------------------------------------------------
-    # Settings
+    # SETTINGS
     # --------------------------------------------------------
 
     settings = raw.get("settings")
@@ -168,120 +220,237 @@ def load_db() -> dict[str, Any]:
     if isinstance(settings, dict):
         db["settings"].update(settings)
 
+    # Normalize settings.
+    try:
+        db["settings"]["interval"] = float(
+            db["settings"].get(
+                "interval",
+                10.0,
+            )
+        )
+    except Exception:
+        db["settings"]["interval"] = 10.0
+
+    try:
+        db["settings"]["retries"] = int(
+            db["settings"].get(
+                "retries",
+                8,
+            )
+        )
+    except Exception:
+        db["settings"]["retries"] = 8
+
+    try:
+        db["settings"]["album_wait"] = float(
+            db["settings"].get(
+                "album_wait",
+                1.5,
+            )
+        )
+    except Exception:
+        db["settings"]["album_wait"] = 1.5
+
+    try:
+        db["settings"]["max_playlist"] = int(
+            db["settings"].get(
+                "max_playlist",
+                50000,
+            )
+        )
+    except Exception:
+        db["settings"]["max_playlist"] = 50000
+
     # --------------------------------------------------------
-    # Sources
+    # SOURCES
     # --------------------------------------------------------
 
     sources = raw.get("sources")
 
     if isinstance(sources, list):
-        db["sources"] = [
-            x for x in sources
-            if isinstance(x, dict) and x.get("id") is not None
-        ]
+
+        for item in sources:
+
+            if (
+                isinstance(item, dict)
+                and item.get("id") is not None
+            ):
+                db["sources"].append(item)
 
     # --------------------------------------------------------
-    # Destinations
+    # DESTINATIONS
     # --------------------------------------------------------
 
-    destinations = raw.get("destinations")
+    destinations = raw.get(
+        "destinations"
+    )
 
     if isinstance(destinations, list):
-        db["destinations"] = [
-            x for x in destinations
-            if isinstance(x, dict) and x.get("id") is not None
-        ]
+
+        for item in destinations:
+
+            if (
+                isinstance(item, dict)
+                and item.get("id") is not None
+            ):
+                db["destinations"].append(
+                    item
+                )
 
     # --------------------------------------------------------
-    # Routes
+    # ROUTES
     # --------------------------------------------------------
 
     routes = raw.get("routes")
 
     if isinstance(routes, dict):
+
         db["routes"] = routes
-    else:
-        # Compatibility with previous version.
-        for source in db["sources"]:
-            sid = str(source["id"])
-
-            db["routes"][sid] = {
-                "source": source,
-                "destinations": list(db["destinations"]),
-            }
 
     # --------------------------------------------------------
-    # Playlists
+    # PLAYLISTS
     # --------------------------------------------------------
 
-    playlists = raw.get("playlists")
+    playlists = raw.get(
+        "playlists"
+    )
 
     if isinstance(playlists, dict):
+
         for sid, items in playlists.items():
 
-            if not isinstance(items, list):
+            if not isinstance(
+                items,
+                list,
+            ):
                 continue
 
-            cleaned: list[dict[str, Any]] = []
+            cleaned: list[
+                dict[str, Any]
+            ] = []
 
             for item in items:
 
-                if isinstance(item, int):
-                    cleaned.append({
-                        "id": int(item),
-                        "ids": [int(item)],
-                        "album": False,
-                        "created": 0,
-                    })
+                # Old/simple format:
+                #
+                # 123
+                #
+                if isinstance(
+                    item,
+                    int,
+                ):
 
-                elif isinstance(item, dict):
+                    cleaned.append(
+                        {
+                            "id": int(item),
+                            "ids": [int(item)],
+                            "album": False,
+                            "created": 0,
+                        }
+                    )
 
-                    ids = item.get("ids")
+                    continue
 
-                    if not isinstance(ids, list):
-                        ids = []
+                if not isinstance(
+                    item,
+                    dict,
+                ):
+                    continue
 
-                    ids = [
-                        int(x)
-                        for x in ids
-                        if str(x).lstrip("-").isdigit()
-                    ]
+                ids = item.get(
+                    "ids",
+                    [],
+                )
 
-                    if not ids and item.get("id") is not None:
-                        try:
-                            ids = [int(item["id"])]
-                        except Exception:
-                            ids = []
+                if not isinstance(
+                    ids,
+                    list,
+                ):
+                    ids = []
 
-                    if ids:
-                        cleaned.append({
-                            "id": ids[0],
-                            "ids": ids,
-                            "album": bool(item.get("album", len(ids) > 1)),
-                            "created": int(
-                                item.get("created", 0) or 0
-                            ),
-                        })
+                clean_ids: list[int] = []
 
-            db["playlists"][str(sid)] = cleaned
+                for value in ids:
+
+                    try:
+                        clean_ids.append(
+                            int(value)
+                        )
+                    except Exception:
+                        pass
+
+                if not clean_ids:
+
+                    try:
+                        if item.get(
+                            "id"
+                        ) is not None:
+                            clean_ids = [
+                                int(
+                                    item["id"]
+                                )
+                            ]
+                    except Exception:
+                        pass
+
+                if not clean_ids:
+                    continue
+
+                try:
+                    created = int(
+                        item.get(
+                            "created",
+                            0,
+                        )
+                        or 0
+                    )
+                except Exception:
+                    created = 0
+
+                cleaned.append(
+                    {
+                        "id": clean_ids[0],
+                        "ids": clean_ids,
+                        "album": bool(
+                            item.get(
+                                "album",
+                                len(clean_ids) > 1,
+                            )
+                        ),
+                        "created": created,
+                    }
+                )
+
+            db["playlists"][
+                str(sid)
+            ] = cleaned
 
     # --------------------------------------------------------
-    # Positions
+    # POSITIONS
     # --------------------------------------------------------
 
-    positions = raw.get("positions")
+    positions = raw.get(
+        "positions"
+    )
 
     if isinstance(positions, dict):
 
-        for sid, value in positions.items():
+        for key, value in positions.items():
 
             try:
-                db["positions"][str(sid)] = int(value)
+                db["positions"][
+                    str(key)
+                ] = max(
+                    0,
+                    int(value),
+                )
             except Exception:
-                db["positions"][str(sid)] = 0
+                db["positions"][
+                    str(key)
+                ] = 0
 
     # --------------------------------------------------------
-    # Stats
+    # STATS
     # --------------------------------------------------------
 
     stats = raw.get("stats")
@@ -290,75 +459,275 @@ def load_db() -> dict[str, Any]:
         db["stats"].update(stats)
 
     # --------------------------------------------------------
-    # Normalization
+    # NORMALIZE SOURCE MAP
     # --------------------------------------------------------
 
-    source_map: dict[str, dict[str, Any]] = {}
+    source_map: dict[
+        str,
+        dict[str, Any],
+    ] = {}
 
     for source in db["sources"]:
 
-        sid = str(source.get("id", ""))
-
-        if sid:
-            source_map[sid] = source
-
-    destination_map: dict[str, dict[str, Any]] = {}
-
-    for destination in db["destinations"]:
-
-        did = str(destination.get("id", ""))
-
-        if did:
-            destination_map[did] = destination
-
-    for sid, route in list(db["routes"].items()):
-
-        sid = str(sid)
-
-        if not isinstance(route, dict):
-            db["routes"].pop(sid, None)
+        if not isinstance(
+            source,
+            dict,
+        ):
             continue
 
-        source = route.get("source")
+        if source.get("id") is None:
+            continue
 
-        if isinstance(source, dict):
-            source_map[sid] = source
-        else:
-            source = source_map.get(sid)
+        sid = str(
+            source["id"]
+        )
+
+        source["id"] = sid
+
+        source_map[sid] = source
+
+    # --------------------------------------------------------
+    # NORMALIZE DESTINATION MAP
+    # --------------------------------------------------------
+
+    destination_map: dict[
+        str,
+        dict[str, Any],
+    ] = {}
+
+    for destination in db[
+        "destinations"
+    ]:
+
+        if not isinstance(
+            destination,
+            dict,
+        ):
+            continue
+
+        if destination.get("id") is None:
+            continue
+
+        did = str(
+            destination["id"]
+        )
+
+        destination["id"] = did
+
+        destination_map[did] = (
+            destination
+        )
+
+    # --------------------------------------------------------
+    # NORMALIZE ROUTES
+    # --------------------------------------------------------
+
+    normalized_routes: dict[
+        str,
+        dict[str, Any],
+    ] = {}
+
+    for raw_sid, route in db[
+        "routes"
+    ].items():
+
+        sid = str(raw_sid)
+
+        if not isinstance(
+            route,
+            dict,
+        ):
+            continue
+
+        source = route.get(
+            "source"
+        )
+
+        if (
+            not isinstance(
+                source,
+                dict,
+            )
+            or source.get("id") is None
+        ):
+
+            source = source_map.get(
+                sid
+            )
 
         if source is None:
+
             source = {
                 "id": sid,
                 "title": sid,
                 "username": "",
             }
 
-        route["source"] = source
+        source["id"] = sid
 
-        dests = route.get("destinations", [])
+        source_map[sid] = source
 
-        if not isinstance(dests, list):
-            dests = []
+        raw_dests = route.get(
+            "destinations",
+            [],
+        )
+
+        if not isinstance(
+            raw_dests,
+            list,
+        ):
+            raw_dests = []
 
         cleaned_dests = []
 
-        for dest in dests:
+        seen_dests = set()
 
-            if not isinstance(dest, dict):
+        for destination in raw_dests:
+
+            if not isinstance(
+                destination,
+                dict,
+            ):
                 continue
 
-            if dest.get("id") is None:
+            if destination.get(
+                "id"
+            ) is None:
                 continue
 
-            did = str(dest["id"])
+            did = str(
+                destination["id"]
+            )
 
-            destination_map[did] = dest
-            cleaned_dests.append(dest)
+            destination["id"] = did
 
-        route["destinations"] = cleaned_dests
+            destination_map[did] = (
+                destination
+            )
 
-    db["sources"] = list(source_map.values())
-    db["destinations"] = list(destination_map.values())
+            if did in seen_dests:
+                continue
+
+            seen_dests.add(did)
+
+            cleaned_dests.append(
+                destination
+            )
+
+        normalized_routes[sid] = {
+            "source": source,
+            "destinations": cleaned_dests,
+        }
+
+    db["routes"] = normalized_routes
+
+    db["sources"] = list(
+        source_map.values()
+    )
+
+    db["destinations"] = list(
+        destination_map.values()
+    )
+
+    # Make sure every source has route.
+    for source in db[
+        "sources"
+    ]:
+
+        sid = str(
+            source["id"]
+        )
+
+        db["routes"].setdefault(
+            sid,
+            {
+                "source": source,
+                "destinations": [],
+            },
+        )
+
+        db["playlists"].setdefault(
+            sid,
+            [],
+        )
+
+    # --------------------------------------------------------
+    # MIGRATE OLD SOURCE POSITIONS
+    # --------------------------------------------------------
+    #
+    # Old version:
+    #
+    # positions = {
+    #     "source_id": 5
+    # }
+    #
+    # New version:
+    #
+    # positions = {
+    #     "source_id|destination_id": 5
+    # }
+    #
+    # We reset route positions to zero during
+    # migration because one source position cannot
+    # safely represent multiple destination positions.
+    #
+
+    migrated_positions: dict[
+        str,
+        int,
+    ] = {}
+
+    for sid, route in db[
+        "routes"
+    ].items():
+
+        for destination in route.get(
+            "destinations",
+            [],
+        ):
+
+            if not isinstance(
+                destination,
+                dict,
+            ):
+                continue
+
+            did = destination.get(
+                "id"
+            )
+
+            if did is None:
+                continue
+
+            key = route_key(
+                sid,
+                str(did),
+            )
+
+            old_value = db[
+                "positions"
+            ].get(
+                key,
+                0,
+            )
+
+            # If already in new format,
+            # keep it.
+            try:
+                migrated_positions[
+                    key
+                ] = max(
+                    0,
+                    int(old_value),
+                )
+            except Exception:
+                migrated_positions[
+                    key
+                ] = 0
+
+    db["positions"] = (
+        migrated_positions
+    )
 
     return db
 
@@ -378,20 +747,19 @@ dp: Dispatcher | None = None
 server_runner: web.AppRunner | None = None
 
 # ============================================================
-# REPEAT WORKERS
+# WORKERS
 # ============================================================
 
-# One worker for every:
-#
-# Source -> Destination
-#
-worker_tasks: dict[str, asyncio.Task] = {}
+# key = source_id|destination_id
+worker_tasks: dict[
+    str,
+    asyncio.Task,
+] = {}
 
-# Prevent duplicate workers.
-worker_locks: dict[str, asyncio.Lock] = {}
-
-# Used to wake sleeping workers when a new post arrives.
-worker_events: dict[str, asyncio.Event] = {}
+worker_events: dict[
+    str,
+    asyncio.Event,
+] = {}
 
 # ============================================================
 # ALBUM BUFFER
@@ -399,7 +767,7 @@ worker_events: dict[str, asyncio.Event] = {}
 
 album_buffer: dict[
     tuple[str, str],
-    list[int],
+    set[int],
 ] = {}
 
 album_tasks: dict[
@@ -437,18 +805,23 @@ class SetPlaylistLimit(StatesGroup):
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 
-def is_admin(obj: Message | CallbackQuery) -> bool:
+def is_admin(
+    obj: Message | CallbackQuery,
+) -> bool:
+
     return bool(
         obj.from_user
         and obj.from_user.id == ADMIN_ID
     )
 
 
-def name_of(item: dict[str, Any] | None) -> str:
+def name_of(
+    item: dict[str, Any] | None,
+) -> str:
 
     if not item:
         return "Unknown"
@@ -461,88 +834,149 @@ def name_of(item: dict[str, Any] | None) -> str:
     )
 
 
+def status_value(
+    value: Any,
+) -> str:
+
+    return getattr(
+        value,
+        "value",
+        str(value),
+    )
+
+
 def source_ids() -> set[str]:
 
     return {
-        str(x["id"])
-        for x in db["sources"]
-        if isinstance(x, dict)
-        and x.get("id") is not None
+        str(item["id"])
+        for item in db["sources"]
+        if isinstance(
+            item,
+            dict,
+        )
+        and item.get("id") is not None
     }
 
 
 def destination_ids() -> set[str]:
 
     return {
-        str(x["id"])
-        for x in db["destinations"]
-        if isinstance(x, dict)
-        and x.get("id") is not None
+        str(item["id"])
+        for item in db["destinations"]
+        if isinstance(
+            item,
+            dict,
+        )
+        and item.get("id") is not None
     }
 
 
-def get_source(sid: str) -> dict[str, Any] | None:
+def get_source(
+    sid: str,
+) -> dict[str, Any] | None:
 
     sid = str(sid)
 
     for source in db["sources"]:
 
-        if str(source.get("id")) == sid:
+        if str(
+            source.get("id")
+        ) == sid:
             return source
 
     return None
 
 
-def get_destination(did: str) -> dict[str, Any] | None:
+def get_destination(
+    did: str,
+) -> dict[str, Any] | None:
 
     did = str(did)
 
-    for destination in db["destinations"]:
+    for destination in db[
+        "destinations"
+    ]:
 
-        if str(destination.get("id")) == did:
+        if str(
+            destination.get("id")
+        ) == did:
             return destination
 
     return None
 
 
-def route_dests(sid: str) -> list[dict[str, Any]]:
+def route_dests(
+    sid: str,
+) -> list[dict[str, Any]]:
 
-    route = db["routes"].get(str(sid))
+    route = db["routes"].get(
+        str(sid)
+    )
 
-    if not isinstance(route, dict):
+    if not isinstance(
+        route,
+        dict,
+    ):
         return []
 
-    dests = route.get("destinations", [])
+    destinations = route.get(
+        "destinations",
+        [],
+    )
 
-    if not isinstance(dests, list):
+    if not isinstance(
+        destinations,
+        list,
+    ):
         return []
 
     return [
-        x for x in dests
-        if isinstance(x, dict)
-        and x.get("id") is not None
+        item
+        for item in destinations
+        if isinstance(
+            item,
+            dict,
+        )
+        and item.get("id") is not None
     ]
 
 
-def route_dest_ids(sid: str) -> set[str]:
+def route_dest_ids(
+    sid: str,
+) -> set[str]:
 
     return {
-        str(x["id"])
-        for x in route_dests(sid)
+        str(item["id"])
+        for item in route_dests(sid)
     }
 
 
-def route_key(sid: str, did: str) -> str:
+def route_key(
+    sid: str,
+    did: str,
+) -> str:
 
-    return f"{sid}|{did}"
+    return (
+        f"{str(sid)}|{str(did)}"
+    )
 
 
-def split_key(key: str) -> tuple[str, str]:
+def split_route_key(
+    key: str,
+) -> tuple[str, str]:
 
-    return key.split("|", 1)
+    if "|" not in key:
+        return key, ""
+
+    return key.split(
+        "|",
+        1,
+    )
 
 
-def parse_chat_id(value: str) -> Any:
+def parse_chat_id(
+    value: str,
+) -> Any:
 
     value = value.strip()
 
@@ -552,27 +986,24 @@ def parse_chat_id(value: str) -> Any:
     return value
 
 
-async def get_chat(value: str) -> Any:
+async def get_chat(
+    value: str,
+) -> Any:
 
     if bot is None:
-        raise RuntimeError("Bot is not initialized.")
+        raise RuntimeError(
+            "Bot is not initialized."
+        )
 
     value = value.strip()
 
     if not value:
-        raise ValueError("Username or chat ID is empty.")
+        raise ValueError(
+            "Username or chat ID is empty."
+        )
 
     return await bot.get_chat(
         parse_chat_id(value)
-    )
-
-
-def status_value(value: Any) -> str:
-
-    return getattr(
-        value,
-        "value",
-        str(value),
     )
 
 
@@ -590,11 +1021,11 @@ async def save_db() -> None:
             exist_ok=True,
         )
 
-        temp_file = DATA_FILE.with_suffix(
-            ".tmp"
+        temp = DATA_FILE.with_name(
+            DATA_FILE.name + ".tmp"
         )
 
-        temp_file.write_text(
+        temp.write_text(
             json.dumps(
                 db,
                 ensure_ascii=False,
@@ -603,11 +1034,13 @@ async def save_db() -> None:
             encoding="utf-8",
         )
 
-        temp_file.replace(DATA_FILE)
+        temp.replace(
+            DATA_FILE
+        )
 
 
 # ============================================================
-# RESOLVE TELEGRAM CHATS
+# RESOLVE SOURCE
 # ============================================================
 
 
@@ -616,15 +1049,24 @@ async def resolve_source(
 ) -> dict[str, str]:
 
     if bot is None:
-        raise RuntimeError("Bot is not initialized.")
+        raise RuntimeError(
+            "Bot is not initialized."
+        )
 
-    chat = await get_chat(value)
+    chat = await get_chat(
+        value
+    )
 
     chat_type = status_value(
-        getattr(chat, "type", "")
+        getattr(
+            chat,
+            "type",
+            "",
+        )
     )
 
     if chat_type != "channel":
+
         raise ValueError(
             "Source must be a Telegram channel."
         )
@@ -637,13 +1079,18 @@ async def resolve_source(
     )
 
     member_status = status_value(
-        getattr(member, "status", "")
+        getattr(
+            member,
+            "status",
+            "",
+        )
     )
 
     if member_status not in {
         "administrator",
         "creator",
     }:
+
         raise PermissionError(
             "Bot must be administrator in source channel."
         )
@@ -661,17 +1108,30 @@ async def resolve_source(
     }
 
 
+# ============================================================
+# RESOLVE DESTINATION
+# ============================================================
+
+
 async def resolve_destination(
     value: str,
 ) -> dict[str, str]:
 
     if bot is None:
-        raise RuntimeError("Bot is not initialized.")
+        raise RuntimeError(
+            "Bot is not initialized."
+        )
 
-    chat = await get_chat(value)
+    chat = await get_chat(
+        value
+    )
 
     chat_type = status_value(
-        getattr(chat, "type", "")
+        getattr(
+            chat,
+            "type",
+            "",
+        )
     )
 
     if chat_type not in {
@@ -679,8 +1139,9 @@ async def resolve_destination(
         "group",
         "supergroup",
     }:
+
         raise ValueError(
-            "Destination must be a channel or group."
+            "Destination must be a channel, group or supergroup."
         )
 
     me = await bot.get_me()
@@ -691,13 +1152,18 @@ async def resolve_destination(
     )
 
     member_status = status_value(
-        getattr(member, "status", "")
+        getattr(
+            member,
+            "status",
+            "",
+        )
     )
 
     if member_status not in {
         "administrator",
         "creator",
     }:
+
         raise PermissionError(
             "Bot must be administrator in destination."
         )
@@ -711,8 +1177,9 @@ async def resolve_destination(
             True,
         ) is False
     ):
+
         raise PermissionError(
-            "Bot needs Post Messages permission."
+            "Bot needs Post Messages permission in destination."
         )
 
     return {
@@ -729,7 +1196,7 @@ async def resolve_destination(
 
 
 # ============================================================
-# PLAYLIST FUNCTIONS
+# PLAYLIST
 # ============================================================
 
 
@@ -739,18 +1206,25 @@ def get_playlist(
 
     sid = str(sid)
 
-    playlist = db["playlists"].get(
+    playlist = db[
+        "playlists"
+    ].get(
         sid,
         [],
     )
 
-    if not isinstance(playlist, list):
+    if not isinstance(
+        playlist,
+        list,
+    ):
         playlist = []
 
     return playlist
 
 
-def playlist_length(sid: str) -> int:
+def playlist_length(
+    sid: str,
+) -> int:
 
     return len(
         get_playlist(sid)
@@ -761,11 +1235,11 @@ async def add_playlist_item(
     sid: str,
     message_ids: list[int],
     album: bool = False,
-) -> None:
+) -> bool:
 
     sid = str(sid)
 
-    clean_ids = []
+    clean_ids: list[int] = []
 
     for mid in message_ids:
 
@@ -777,47 +1251,74 @@ async def add_playlist_item(
             pass
 
     if not clean_ids:
-        return
+        return False
+
+    # Preserve Telegram message order.
+    clean_ids = list(
+        dict.fromkeys(
+            clean_ids
+        )
+    )
+
+    added = False
 
     async with playlist_lock:
 
-        playlist = db["playlists"].setdefault(
+        playlist = db[
+            "playlists"
+        ].setdefault(
             sid,
             [],
         )
 
-        # Duplicate protection.
-        existing_ids = set()
+        # ----------------------------------------------------
+        # Check duplicate message IDs.
+        # ----------------------------------------------------
+
+        existing = set()
 
         for item in playlist:
 
-            if not isinstance(item, dict):
+            if not isinstance(
+                item,
+                dict,
+            ):
                 continue
 
-            for mid in item.get(
+            ids = item.get(
                 "ids",
                 [],
+            )
+
+            if not isinstance(
+                ids,
+                list,
             ):
+                continue
+
+            for value in ids:
 
                 try:
-                    existing_ids.add(
-                        int(mid)
+                    existing.add(
+                        int(value)
                     )
                 except Exception:
                     pass
 
         if any(
-            mid in existing_ids
+            mid in existing
             for mid in clean_ids
         ):
-            return
+
+            return False
 
         playlist.append(
             {
                 "id": clean_ids[0],
                 "ids": clean_ids,
                 "album": bool(
-                    album or len(clean_ids) > 1
+                    album
+                    or len(clean_ids) > 1
                 ),
                 "created": int(
                     time.time()
@@ -825,17 +1326,30 @@ async def add_playlist_item(
             }
         )
 
-        max_playlist = max(
-            1,
-            int(
+        added = True
+
+        # ----------------------------------------------------
+        # Limit playlist.
+        # ----------------------------------------------------
+
+        try:
+            max_playlist = int(
                 db["settings"].get(
                     "max_playlist",
                     50000,
                 )
+            )
+        except Exception:
+            max_playlist = 50000
+
+        max_playlist = max(
+            100,
+            min(
+                50000,
+                max_playlist,
             ),
         )
 
-        # Keep latest items.
         if len(playlist) > max_playlist:
 
             remove_count = (
@@ -847,138 +1361,1219 @@ async def add_playlist_item(
                 :remove_count
             ]
 
-            current = int(
-                db["positions"].get(
-                    sid,
-                    0,
+            # Correct every route position
+            # for this source.
+            for key in list(
+                db["positions"]
+            ):
+
+                route_sid, _ = (
+                    split_route_key(key)
                 )
-            )
 
-            current -= remove_count
+                if route_sid != sid:
+                    continue
 
-            db["positions"][sid] = max(
-                0,
-                current,
-            )
+                try:
+                    position = int(
+                        db["positions"][
+                            key
+                        ]
+                    )
+                except Exception:
+                    position = 0
 
-    await save_db()
+                db["positions"][
+                    key
+                ] = max(
+                    0,
+                    position
+                    - remove_count,
+                )
+
+    if added:
+        await save_db()
+
+    return added
 
 
 def next_playlist_item(
     sid: str,
-) -> tuple[dict[str, Any] | None, bool]:
+    did: str,
+) -> tuple[
+    dict[str, Any] | None,
+    bool,
+]:
 
     sid = str(sid)
+    did = str(did)
 
-    playlist = get_playlist(sid)
+    playlist = get_playlist(
+        sid
+    )
 
     if not playlist:
         return None, False
 
-    position = int(
-        db["positions"].get(
-            sid,
-            0,
-        )
+    key = route_key(
+        sid,
+        did,
     )
+
+    try:
+        position = int(
+            db["positions"].get(
+                key,
+                0,
+            )
+        )
+    except Exception:
+        position = 0
 
     if position < 0:
         position = 0
 
+    # If playlist was shortened/deleted.
     if position >= len(playlist):
-
         position = 0
 
-        db["positions"][sid] = 0
+    item = playlist[
+        position
+    ]
 
-        return playlist[0], True
+    # --------------------------------------------------------
+    # IMPORTANT REPEAT LOGIC
+    #
+    # First = index 0
+    # Second = index 1
+    # ...
+    # Last = index len-1
+    #
+    # After Last:
+    # position becomes 0.
+    #
+    # Therefore:
+    #
+    # First → Second → ... → Last → First
+    # --------------------------------------------------------
 
-    item = playlist[position]
+    next_position = (
+        position + 1
+    )
 
-    position += 1
+    cycle_finished = (
+        next_position >= len(playlist)
+    )
 
-    cycle_finished = False
+    if cycle_finished:
+        next_position = 0
 
-    if position >= len(playlist):
-
-        # The LAST post has just been selected.
-        #
-        # Next call will start from First.
-        #
-        db["positions"][sid] = 0
-
-        cycle_finished = True
-
-    else:
-
-        db["positions"][sid] = position
+    db["positions"][
+        key
+    ] = next_position
 
     return item, cycle_finished
 
 
 # ============================================================
-# HOME UI
+# WAKE WORKERS
+# ============================================================
+
+
+def get_worker_event(
+    key: str,
+) -> asyncio.Event:
+
+    event = worker_events.get(
+        key
+    )
+
+    if event is None:
+
+        event = asyncio.Event()
+
+        worker_events[key] = event
+
+    return event
+
+
+def wake_route(
+    sid: str,
+    did: str,
+) -> None:
+
+    key = route_key(
+        sid,
+        did,
+    )
+
+    event = worker_events.get(
+        key
+    )
+
+    if event:
+        event.set()
+
+
+def wake_source(
+    sid: str,
+) -> None:
+
+    sid = str(sid)
+
+    for key, event in list(
+        worker_events.items()
+    ):
+
+        route_sid, _ = (
+            split_route_key(key)
+        )
+
+        if route_sid == sid:
+            event.set()
+
+
+def wake_all_workers() -> None:
+
+    for event in list(
+        worker_events.values()
+    ):
+        event.set()
+
+
+# ============================================================
+# COPY MESSAGE
+# ============================================================
+
+
+async def copy_one(
+    sid: str,
+    did: str,
+    mid: int,
+) -> bool:
+
+    if bot is None:
+        return False
+
+    try:
+        retries = int(
+            db["settings"].get(
+                "retries",
+                8,
+            )
+        )
+    except Exception:
+        retries = 8
+
+    retries = max(
+        0,
+        min(
+            20,
+            retries,
+        ),
+    )
+
+    for attempt in range(
+        retries + 1
+    ):
+
+        try:
+
+            log.info(
+                "COPY %s -> %s | message=%s | attempt=%s",
+                sid,
+                did,
+                mid,
+                attempt + 1,
+            )
+
+            await bot.copy_message(
+                chat_id=int(did),
+                from_chat_id=int(sid),
+                message_id=int(mid),
+            )
+
+            log.info(
+                "COPY SUCCESS %s -> %s | message=%s",
+                sid,
+                did,
+                mid,
+            )
+
+            return True
+
+        except TelegramRetryAfter as exc:
+
+            try:
+                wait = int(
+                    exc.retry_after
+                ) + 1
+            except Exception:
+                wait = 5
+
+            log.warning(
+                "Telegram rate limit. Sleeping %ss.",
+                wait,
+            )
+
+            await asyncio.sleep(
+                wait
+            )
+
+        except TelegramNetworkError as exc:
+
+            db["stats"][
+                "last_error"
+            ] = str(exc)
+
+            if attempt >= retries:
+                return False
+
+            wait = min(
+                2 ** attempt,
+                30,
+            )
+
+            log.warning(
+                "Network error. Retry in %ss.",
+                wait,
+            )
+
+            await asyncio.sleep(
+                wait
+            )
+
+        except TelegramForbiddenError as exc:
+
+            db["stats"][
+                "last_error"
+            ] = str(exc)
+
+            log.error(
+                "Forbidden %s -> %s: %s",
+                sid,
+                did,
+                exc,
+            )
+
+            return False
+
+        except TelegramBadRequest as exc:
+
+            db["stats"][
+                "last_error"
+            ] = str(exc)
+
+            log.error(
+                "BadRequest %s -> %s | message=%s | %s",
+                sid,
+                did,
+                mid,
+                exc,
+            )
+
+            return False
+
+        except Exception as exc:
+
+            db["stats"][
+                "last_error"
+            ] = str(exc)
+
+            log.exception(
+                "Unexpected copy error."
+            )
+
+            if attempt >= retries:
+                return False
+
+            await asyncio.sleep(
+                min(
+                    2 ** attempt,
+                    30,
+                )
+            )
+
+    return False
+
+
+# ============================================================
+# COPY ALBUM
+# ============================================================
+
+
+async def copy_album(
+    sid: str,
+    did: str,
+    message_ids: list[int],
+) -> bool:
+
+    success = True
+
+    for index, mid in enumerate(
+        message_ids
+    ):
+
+        ok = await copy_one(
+            sid,
+            did,
+            mid,
+        )
+
+        if not ok:
+            success = False
+
+        if (
+            index
+            < len(message_ids) - 1
+        ):
+
+            try:
+                interval = float(
+                    db["settings"].get(
+                        "interval",
+                        10.0,
+                    )
+                )
+            except Exception:
+                interval = 10.0
+
+            # Don't wait the full interval
+            # between items of an album.
+            await asyncio.sleep(
+                min(
+                    max(
+                        interval,
+                        0.1,
+                    ),
+                    1.0,
+                )
+            )
+
+    return success
+
+
+# ============================================================
+# REPEAT WORKER
+# ============================================================
+
+
+async def repeat_worker(
+    sid: str,
+    did: str,
+) -> None:
+
+    sid = str(sid)
+    did = str(did)
+
+    key = route_key(
+        sid,
+        did,
+    )
+
+    event = get_worker_event(
+        key
+    )
+
+    log.info(
+        "WORKER STARTED | %s -> %s",
+        sid,
+        did,
+    )
+
+    while True:
+
+        try:
+
+            # ------------------------------------------------
+            # GLOBAL STOP
+            # ------------------------------------------------
+
+            if not db["settings"].get(
+                "enabled",
+                True,
+            ):
+
+                event.clear()
+
+                try:
+                    await asyncio.wait_for(
+                        event.wait(),
+                        timeout=5,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                continue
+
+            # ------------------------------------------------
+            # SOURCE STILL EXISTS?
+            # ------------------------------------------------
+
+            if sid not in source_ids():
+
+                await asyncio.sleep(
+                    2
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # DESTINATION STILL IN ROUTE?
+            # ------------------------------------------------
+
+            if did not in route_dest_ids(
+                sid
+            ):
+
+                await asyncio.sleep(
+                    2
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # REPEAT OFF
+            # ------------------------------------------------
+
+            if not db[
+                "settings"
+            ].get(
+                "repeat_enabled",
+                True,
+            ):
+
+                event.clear()
+
+                try:
+                    await asyncio.wait_for(
+                        event.wait(),
+                        timeout=5,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                continue
+
+            # ------------------------------------------------
+            # PLAYLIST EMPTY
+            # ------------------------------------------------
+
+            if not get_playlist(sid):
+
+                event.clear()
+
+                try:
+                    await asyncio.wait_for(
+                        event.wait(),
+                        timeout=10,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                continue
+
+            # ------------------------------------------------
+            # SELECT NEXT
+            # ------------------------------------------------
+
+            async with playlist_lock:
+
+                item, cycle_finished = (
+                    next_playlist_item(
+                        sid,
+                        did,
+                    )
+                )
+
+                if cycle_finished:
+
+                    db["stats"][
+                        "cycles"
+                    ] += 1
+
+            if item is None:
+
+                await asyncio.sleep(
+                    2
+                )
+
+                continue
+
+            # Save position immediately.
+            await save_db()
+
+            ids = item.get(
+                "ids",
+                [],
+            )
+
+            if not isinstance(
+                ids,
+                list,
+            ):
+                ids = []
+
+            clean_ids = []
+
+            for value in ids:
+
+                try:
+                    clean_ids.append(
+                        int(value)
+                    )
+                except Exception:
+                    pass
+
+            if not clean_ids:
+                continue
+
+            log.info(
+                "PLAYLIST ITEM | route=%s | message=%s | album=%s",
+                key,
+                clean_ids,
+                len(clean_ids) > 1,
+            )
+
+            # ------------------------------------------------
+            # COPY
+            # ------------------------------------------------
+
+            if len(clean_ids) == 1:
+
+                success = await copy_one(
+                    sid,
+                    did,
+                    clean_ids[0],
+                )
+
+            else:
+
+                success = await copy_album(
+                    sid,
+                    did,
+                    clean_ids,
+                )
+
+            # ------------------------------------------------
+            # STATS
+            # ------------------------------------------------
+
+            if success:
+
+                db["stats"][
+                    "sent"
+                ] += 1
+
+                db["stats"][
+                    "last_sent"
+                ] = int(
+                    time.time()
+                )
+
+            else:
+
+                db["stats"][
+                    "failed"
+                ] += 1
+
+            await save_db()
+
+            # ------------------------------------------------
+            # INTERVAL
+            # ------------------------------------------------
+
+            try:
+                interval = float(
+                    db["settings"].get(
+                        "interval",
+                        10.0,
+                    )
+                )
+            except Exception:
+                interval = 10.0
+
+            interval = max(
+                0.1,
+                min(
+                    3600.0,
+                    interval,
+                ),
+            )
+
+            # Wake instantly if a new item/settings
+            # arrives; otherwise wait interval.
+            event.clear()
+
+            try:
+
+                await asyncio.wait_for(
+                    event.wait(),
+                    timeout=interval,
+                )
+
+            except asyncio.TimeoutError:
+                pass
+
+        except asyncio.CancelledError:
+
+            log.info(
+                "WORKER STOPPED | %s -> %s",
+                sid,
+                did,
+            )
+
+            raise
+
+        except Exception as exc:
+
+            db["stats"][
+                "last_error"
+            ] = str(exc)
+
+            log.exception(
+                "Worker crashed internally | %s -> %s",
+                sid,
+                did,
+            )
+
+            await asyncio.sleep(
+                3
+            )
+
+
+# ============================================================
+# WORKER MANAGEMENT
+# ============================================================
+
+
+async def start_worker(
+    sid: str,
+    did: str,
+) -> None:
+
+    sid = str(sid)
+    did = str(did)
+
+    key = route_key(
+        sid,
+        did,
+    )
+
+    existing = worker_tasks.get(
+        key
+    )
+
+    if (
+        existing is not None
+        and not existing.done()
+    ):
+        return
+
+    worker_events[key] = (
+        asyncio.Event()
+    )
+
+    worker_tasks[key] = (
+        asyncio.create_task(
+            repeat_worker(
+                sid,
+                did,
+            ),
+            name=(
+                f"repeat-{sid}-{did}"
+            ),
+        )
+    )
+
+
+async def stop_worker(
+    sid: str,
+    did: str,
+) -> None:
+
+    key = route_key(
+        sid,
+        did,
+    )
+
+    task = worker_tasks.pop(
+        key,
+        None,
+    )
+
+    event = worker_events.pop(
+        key,
+        None,
+    )
+
+    if event:
+        event.set()
+
+    if task is None:
+        return
+
+    if not task.done():
+        task.cancel()
+
+    try:
+
+        await task
+
+    except asyncio.CancelledError:
+        pass
+
+    except Exception:
+
+        log.exception(
+            "Worker shutdown error | %s",
+            key,
+        )
+
+
+async def ensure_workers() -> None:
+
+    wanted: set[str] = set()
+
+    if db["settings"].get(
+        "enabled",
+        True,
+    ):
+
+        for sid, route in list(
+            db["routes"].items()
+        ):
+
+            sid = str(sid)
+
+            if not isinstance(
+                route,
+                dict,
+            ):
+                continue
+
+            destinations = route.get(
+                "destinations",
+                [],
+            )
+
+            if not isinstance(
+                destinations,
+                list,
+            ):
+                continue
+
+            for destination in destinations:
+
+                if not isinstance(
+                    destination,
+                    dict,
+                ):
+                    continue
+
+                did = destination.get(
+                    "id"
+                )
+
+                if did is None:
+                    continue
+
+                did = str(did)
+
+                key = route_key(
+                    sid,
+                    did,
+                )
+
+                wanted.add(key)
+
+                await start_worker(
+                    sid,
+                    did,
+                )
+
+    # Stop workers that are no longer needed.
+    for key in list(
+        worker_tasks.keys()
+    ):
+
+        if key in wanted:
+            continue
+
+        sid, did = (
+            split_route_key(key)
+        )
+
+        await stop_worker(
+            sid,
+            did,
+        )
+
+
+# ============================================================
+# ALBUM FLUSH
+# ============================================================
+
+
+async def flush_album(
+    sid: str,
+    album_id: str,
+) -> None:
+
+    key = (
+        str(sid),
+        str(album_id),
+    )
+
+    try:
+
+        try:
+            wait = float(
+                db["settings"].get(
+                    "album_wait",
+                    1.5,
+                )
+            )
+        except Exception:
+            wait = 1.5
+
+        await asyncio.sleep(
+            max(
+                0.2,
+                min(
+                    10.0,
+                    wait,
+                ),
+            )
+        )
+
+        mids = album_buffer.pop(
+            key,
+            set(),
+        )
+
+        if not mids:
+            return
+
+        ordered = sorted(
+            int(mid)
+            for mid in mids
+        )
+
+        added = await add_playlist_item(
+            sid,
+            ordered,
+            album=True,
+        )
+
+        if added:
+
+            db["stats"][
+                "albums"
+            ] += 1
+
+            db["stats"][
+                "received"
+            ] += len(ordered)
+
+            db["stats"][
+                "last_received"
+            ] = int(
+                time.time()
+            )
+
+            await save_db()
+
+            wake_source(
+                sid
+            )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+
+        db["stats"][
+            "last_error"
+        ] = str(exc)
+
+        log.exception(
+            "Album flush failed."
+        )
+
+    finally:
+
+        album_tasks.pop(
+            key,
+            None,
+        )
+
+
+# ============================================================
+# CHANNEL POST
+# ============================================================
+
+
+@router.channel_post()
+async def channel_post(
+    message: Message,
+) -> None:
+
+    sid = str(
+        message.chat.id
+    )
+
+    mid = int(
+        message.message_id
+    )
+
+    log.info(
+        "NEW CHANNEL POST | source=%s | message=%s | type=%s",
+        sid,
+        mid,
+        message.content_type,
+    )
+
+    # Only configured sources.
+    if sid not in source_ids():
+        return
+
+    # --------------------------------------------------------
+    # ALBUM
+    # --------------------------------------------------------
+
+    album_id = message.media_group_id
+
+    if album_id:
+
+        key = (
+            sid,
+            str(album_id),
+        )
+
+        album_buffer.setdefault(
+            key,
+            set(),
+        ).add(mid)
+
+        old_task = album_tasks.get(
+            key
+        )
+
+        if old_task is not None:
+
+            old_task.cancel()
+
+        album_tasks[key] = (
+            asyncio.create_task(
+                flush_album(
+                    sid,
+                    str(album_id),
+                )
+            )
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # NORMAL POST
+    # --------------------------------------------------------
+
+    added = await add_playlist_item(
+        sid,
+        [mid],
+        album=False,
+    )
+
+    if not added:
+        return
+
+    db["stats"][
+        "received"
+    ] += 1
+
+    db["stats"][
+        "last_received"
+    ] = int(
+        time.time()
+    )
+
+    await save_db()
+
+    # Wake all destinations for this source.
+    wake_source(
+        sid
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+
+@router.message(
+    CommandStart()
+)
+async def start_cmd(
+    message: Message,
+    state: FSMContext,
+) -> None:
+
+    await state.clear()
+
+    if not is_admin(message):
+
+        await message.answer(
+            "Only admin can access this bot."
+        )
+
+        return
+
+    await message.answer(
+        home_text(),
+        reply_markup=home_kb(),
+    )
+
+
+# ============================================================
+# /ADMIN
+# ============================================================
+
+
+@router.message(
+    Command("admin")
+)
+async def admin_cmd(
+    message: Message,
+    state: FSMContext,
+) -> None:
+
+    await state.clear()
+
+    if not is_admin(message):
+
+        await message.answer(
+            "Only admin can access this bot."
+        )
+
+        return
+
+    await message.answer(
+        home_text(),
+        reply_markup=home_kb(),
+    )
+
+
+# ============================================================
+# /CANCEL
+# ============================================================
+
+
+@router.message(
+    Command("cancel")
+)
+async def cancel_cmd(
+    message: Message,
+    state: FSMContext,
+) -> None:
+
+    await state.clear()
+
+    if is_admin(message):
+
+        await message.answer(
+            "❌ Cancelled.",
+            reply_markup=home_kb(),
+        )
+
+
+# ============================================================
+# HOME
 # ============================================================
 
 
 def home_text() -> str:
 
-    s = db["settings"]
-    st = db["stats"]
+    settings = db[
+        "settings"
+    ]
+
+    stats = db[
+        "stats"
+    ]
 
     running = (
         "🟢 RUNNING"
-        if s["enabled"]
+        if settings.get(
+            "enabled",
+            True,
+        )
         else "🔴 STOPPED"
     )
 
     repeat = (
         "🟢 ON"
-        if s["repeat_enabled"]
+        if settings.get(
+            "repeat_enabled",
+            True,
+        )
         else "🔴 OFF"
     )
 
-    routes = sum(
-        bool(
-            route_dests(
-                str(source["id"])
-            )
-        )
-        for source in db["sources"]
-    )
+    routes_count = 0
 
-    total_playlist = sum(
-        len(get_playlist(str(source["id"])))
+    for source in db[
+        "sources"
+    ]:
+
+        sid = str(
+            source["id"]
+        )
+
+        if route_dests(sid):
+            routes_count += 1
+
+    playlist_count = sum(
+        playlist_length(
+            str(source["id"])
+        )
         for source in db["sources"]
     )
 
     return (
         "🤖 <b>Route Repeat Copy Bot</b>\n\n"
-
         f"Status: <b>{running}</b>\n"
         f"Repeat: <b>{repeat}</b>\n\n"
-
-        f"Sources: <b>{len(db['sources'])}</b>\n"
-        f"Destinations: <b>{len(db['destinations'])}</b>\n"
-        f"Routes: <b>{routes}</b>\n"
-        f"Playlist items: <b>{total_playlist}</b>\n\n"
-
-        f"⏱ Interval: <b>{s['interval']}s</b>\n"
-        f"📦 Album wait: <b>{s['album_wait']}s</b>\n"
-        f"🔁 Retries: <b>{s['retries']}</b>\n"
-        f"📚 Max playlist: <b>{s['max_playlist']}</b>\n\n"
-
-        f"📥 Received: <b>{st['received']}</b>\n"
-        f"📤 Sent: <b>{st['sent']}</b>\n"
-        f"❌ Failed: <b>{st['failed']}</b>\n"
-        f"🔄 Cycles: <b>{st['cycles']}</b>"
+        f"📥 Sources: <b>{len(db['sources'])}</b>\n"
+        f"📤 Destinations: <b>{len(db['destinations'])}</b>\n"
+        f"🔀 Routes: <b>{routes_count}</b>\n"
+        f"📚 Playlist items: <b>{playlist_count}</b>\n\n"
+        f"⏱ Interval: <b>{settings['interval']}s</b>\n"
+        f"📦 Album wait: <b>{settings['album_wait']}s</b>\n"
+        f"🔁 Retries: <b>{settings['retries']}</b>\n"
+        f"📚 Max playlist: <b>{settings['max_playlist']}</b>\n\n"
+        f"📥 Received: <b>{stats['received']}</b>\n"
+        f"📤 Sent: <b>{stats['sent']}</b>\n"
+        f"❌ Failed: <b>{stats['failed']}</b>\n"
+        f"🔄 Cycles: <b>{stats['cycles']}</b>"
     )
 
 
 def home_kb() -> InlineKeyboardMarkup:
 
-    running = db["settings"]["enabled"]
-    repeat = db["settings"]["repeat_enabled"]
+    running = bool(
+        db["settings"].get(
+            "enabled",
+            True,
+        )
+    )
+
+    repeat = bool(
+        db["settings"].get(
+            "repeat_enabled",
+            True,
+        )
+    )
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -990,9 +2585,8 @@ def home_kb() -> InlineKeyboardMarkup:
                         else "▶️ Start"
                     ),
                     callback_data="toggle",
-                ),
+                )
             ],
-
             [
                 InlineKeyboardButton(
                     text=(
@@ -1001,39 +2595,33 @@ def home_kb() -> InlineKeyboardMarkup:
                         else "🔁 Repeat: OFF"
                     ),
                     callback_data="repeat",
-                ),
+                )
             ],
-
             [
                 InlineKeyboardButton(
                     text="🔀 Routes",
                     callback_data="sources",
                 ),
-
                 InlineKeyboardButton(
                     text="📤 Destinations",
                     callback_data="destinations",
                 ),
             ],
-
             [
                 InlineKeyboardButton(
                     text="📚 Playlists",
                     callback_data="playlists",
                 ),
-
                 InlineKeyboardButton(
                     text="⚙️ Settings",
                     callback_data="settings",
                 ),
             ],
-
             [
                 InlineKeyboardButton(
                     text="📊 Status",
                     callback_data="status",
                 ),
-
                 InlineKeyboardButton(
                     text="🔄 Refresh",
                     callback_data="home",
@@ -1044,7 +2632,7 @@ def home_kb() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# SOURCE UI
+# SOURCE KEYBOARD
 # ============================================================
 
 
@@ -1056,7 +2644,9 @@ def sources_kb() -> InlineKeyboardMarkup:
         db["sources"]
     ):
 
-        sid = str(source["id"])
+        sid = str(
+            source["id"]
+        )
 
         rows.append(
             [
@@ -1066,7 +2656,9 @@ def sources_kb() -> InlineKeyboardMarkup:
                         f"[{len(route_dests(sid))}] "
                         f"[📚 {playlist_length(sid)}]"
                     ),
-                    callback_data=f"route:{index}",
+                    callback_data=(
+                        f"route:{index}"
+                    ),
                 )
             ]
         )
@@ -1094,11 +2686,18 @@ def sources_kb() -> InlineKeyboardMarkup:
     )
 
 
+# ============================================================
+# ROUTE KEYBOARD
+# ============================================================
+
+
 def route_kb(
     sid: str,
 ) -> InlineKeyboardMarkup:
 
-    selected = route_dest_ids(sid)
+    selected = route_dest_ids(
+        sid
+    )
 
     rows = []
 
@@ -1174,7 +2773,7 @@ def route_kb(
 
 
 # ============================================================
-# DESTINATION UI
+# DESTINATION KEYBOARD
 # ============================================================
 
 
@@ -1191,10 +2790,12 @@ def dest_kb() -> InlineKeyboardMarkup:
         )
 
         used = sum(
-            did in route_dest_ids(
+            1
+            for source in db["sources"]
+            if did
+            in route_dest_ids(
                 str(source["id"])
             )
-            for source in db["sources"]
         )
 
         rows.append(
@@ -1215,7 +2816,9 @@ def dest_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 text="➕ Add Destination",
-                callback_data="add_destination",
+                callback_data=(
+                    "add_destination"
+                ),
             )
         ]
     )
@@ -1235,7 +2838,7 @@ def dest_kb() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# PLAYLIST UI
+# PLAYLIST KEYBOARD
 # ============================================================
 
 
@@ -1247,7 +2850,7 @@ def playlist_kb(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⏮ Reset Position",
+                    text="⏮ Reset ALL Route Positions",
                     callback_data=(
                         f"reset_playlist:{sid}"
                     ),
@@ -1267,64 +2870,69 @@ def playlist_kb(
                     callback_data=(
                         f"route_by_id:{sid}"
                     ),
-                )
+                ),
             ],
         ]
     )
 
 
 # ============================================================
-# SETTINGS UI
+# SETTINGS KEYBOARD
 # ============================================================
 
 
 def settings_kb() -> InlineKeyboardMarkup:
 
-    s = db["settings"]
+    s = db[
+        "settings"
+    ]
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-
             [
                 InlineKeyboardButton(
                     text=(
                         f"⏱ Interval: "
                         f"{s['interval']}s"
                     ),
-                    callback_data="set:interval",
+                    callback_data=(
+                        "set:interval"
+                    ),
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text=(
                         f"📦 Album Wait: "
                         f"{s['album_wait']}s"
                     ),
-                    callback_data="set:album",
+                    callback_data=(
+                        "set:album"
+                    ),
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text=(
                         f"🔁 Retries: "
                         f"{s['retries']}"
                     ),
-                    callback_data="set:retries",
+                    callback_data=(
+                        "set:retries"
+                    ),
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text=(
                         f"📚 Max Playlist: "
                         f"{s['max_playlist']}"
                     ),
-                    callback_data="set:playlist",
+                    callback_data=(
+                        "set:playlist"
+                    ),
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text="⬅️ Back",
@@ -1336,854 +2944,7 @@ def settings_kb() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# WORKER EVENT
-# ============================================================
-
-
-def get_worker_event(
-    key: str,
-) -> asyncio.Event:
-
-    event = worker_events.get(key)
-
-    if event is None:
-
-        event = asyncio.Event()
-
-        worker_events[key] = event
-
-    return event
-
-
-def wake_workers_for_source(
-    sid: str,
-) -> None:
-
-    sid = str(sid)
-
-    for key, event in worker_events.items():
-
-        try:
-            worker_sid, _ = split_key(key)
-
-            if worker_sid == sid:
-                event.set()
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# COPY WITH RETRIES
-# ============================================================
-
-
-async def copy_one(
-    sid: str,
-    did: str,
-    mid: int,
-) -> bool:
-
-    if bot is None:
-        return False
-
-    retries = max(
-        0,
-        int(
-            db["settings"].get(
-                "retries",
-                8,
-            )
-        ),
-    )
-
-    for attempt in range(
-        retries + 1
-    ):
-
-        try:
-
-            log.info(
-                "COPY %s -> %s | message=%s",
-                sid,
-                did,
-                mid,
-            )
-
-            await bot.copy_message(
-                chat_id=int(did),
-                from_chat_id=int(sid),
-                message_id=int(mid),
-            )
-
-            log.info(
-                "COPY OK %s -> %s | message=%s",
-                sid,
-                did,
-                mid,
-            )
-
-            return True
-
-        except TelegramRetryAfter as exc:
-
-            wait = int(
-                exc.retry_after
-            ) + 1
-
-            log.warning(
-                "Rate limited. Waiting %ss",
-                wait,
-            )
-
-            await asyncio.sleep(
-                wait
-            )
-
-        except TelegramNetworkError as exc:
-
-            db["stats"]["last_error"] = str(
-                exc
-            )
-
-            if attempt >= retries:
-                return False
-
-            await asyncio.sleep(
-                min(
-                    2 ** attempt,
-                    30,
-                )
-            )
-
-        except TelegramForbiddenError as exc:
-
-            db["stats"]["last_error"] = str(
-                exc
-            )
-
-            log.error(
-                "Forbidden %s -> %s: %s",
-                sid,
-                did,
-                exc,
-            )
-
-            return False
-
-        except TelegramBadRequest as exc:
-
-            db["stats"]["last_error"] = str(
-                exc
-            )
-
-            log.error(
-                "BadRequest %s -> %s | %s",
-                sid,
-                did,
-                exc,
-            )
-
-            return False
-
-        except Exception as exc:
-
-            db["stats"]["last_error"] = str(
-                exc
-            )
-
-            log.exception(
-                "Unexpected copy error"
-            )
-
-            if attempt >= retries:
-                return False
-
-            await asyncio.sleep(
-                min(
-                    2 ** attempt,
-                    30,
-                )
-            )
-
-    return False
-
-
-# ============================================================
-# ALBUM COPY
-# ============================================================
-
-
-async def copy_album(
-    sid: str,
-    did: str,
-    message_ids: list[int],
-) -> bool:
-
-    success = True
-
-    for mid in message_ids:
-
-        ok = await copy_one(
-            sid,
-            did,
-            mid,
-        )
-
-        if not ok:
-            success = False
-
-        interval = float(
-            db["settings"].get(
-                "interval",
-                1.0,
-            )
-        )
-
-        if interval > 0:
-            await asyncio.sleep(
-                interval
-            )
-
-    return success
-
-
-# ============================================================
-# REPEAT WORKER
-# ============================================================
-
-
-async def repeat_worker(
-    sid: str,
-    did: str,
-) -> None:
-
-    key = route_key(
-        sid,
-        did,
-    )
-
-    event = get_worker_event(
-        key
-    )
-
-    log.info(
-        "REPEAT WORKER STARTED %s -> %s",
-        sid,
-        did,
-    )
-
-    while True:
-
-        try:
-
-            # ------------------------------------------------
-            # STOP MODE
-            # ------------------------------------------------
-
-            if not db["settings"]["enabled"]:
-
-                event.clear()
-
-                try:
-                    await asyncio.wait_for(
-                        event.wait(),
-                        timeout=5,
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
-                continue
-
-            # ------------------------------------------------
-            # CHECK ROUTE
-            # ------------------------------------------------
-
-            if sid not in source_ids():
-
-                await asyncio.sleep(2)
-
-                continue
-
-            if did not in route_dest_ids(
-                sid
-            ):
-
-                await asyncio.sleep(2)
-
-                continue
-
-            # ------------------------------------------------
-            # PLAYLIST
-            # ------------------------------------------------
-
-            playlist = get_playlist(
-                sid
-            )
-
-            if not playlist:
-
-                # No playlist yet.
-                #
-                # Wait for NEW channel post.
-                #
-                event.clear()
-
-                try:
-                    await asyncio.wait_for(
-                        event.wait(),
-                        timeout=10,
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
-                continue
-
-            # ------------------------------------------------
-            # REPEAT DISABLED
-            # ------------------------------------------------
-
-            if not db["settings"][
-                "repeat_enabled"
-            ]:
-
-                event.clear()
-
-                try:
-                    await asyncio.wait_for(
-                        event.wait(),
-                        timeout=5,
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
-                continue
-
-            # ------------------------------------------------
-            # GET NEXT ITEM
-            # ------------------------------------------------
-
-            async with playlist_lock:
-
-                item, cycle_finished = (
-                    next_playlist_item(
-                        sid
-                    )
-                )
-
-                if cycle_finished:
-                    db["stats"]["cycles"] += 1
-
-                await save_db()
-
-            if item is None:
-
-                await asyncio.sleep(2)
-
-                continue
-
-            mids = item.get(
-                "ids",
-                [],
-            )
-
-            if not isinstance(
-                mids,
-                list,
-            ):
-                mids = []
-
-            mids = [
-                int(x)
-                for x in mids
-                if str(x).lstrip("-").isdigit()
-            ]
-
-            if not mids:
-
-                continue
-
-            # ------------------------------------------------
-            # COPY ITEM
-            # ------------------------------------------------
-
-            if len(mids) == 1:
-
-                ok = await copy_one(
-                    sid,
-                    did,
-                    mids[0],
-                )
-
-            else:
-
-                ok = await copy_album(
-                    sid,
-                    did,
-                    mids,
-                )
-
-            # ------------------------------------------------
-            # STATS
-            # ------------------------------------------------
-
-            if ok:
-
-                db["stats"]["sent"] += 1
-                db["stats"]["last_sent"] = int(
-                    time.time()
-                )
-
-            else:
-
-                db["stats"]["failed"] += 1
-
-            await save_db()
-
-            # ------------------------------------------------
-            # IMPORTANT:
-            #
-            # This is what creates:
-            #
-            # First
-            # Second
-            # Third
-            # ...
-            # Last
-            # First
-            # Second
-            #
-            # The position is reset to 0 after Last.
-            # ------------------------------------------------
-
-            interval = float(
-                db["settings"].get(
-                    "interval",
-                    1.0,
-                )
-            )
-
-            if interval > 0:
-
-                event.clear()
-
-                try:
-                    await asyncio.wait_for(
-                        event.wait(),
-                        timeout=interval,
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
-        except asyncio.CancelledError:
-
-            log.info(
-                "REPEAT WORKER STOPPED %s -> %s",
-                sid,
-                did,
-            )
-
-            raise
-
-        except Exception as exc:
-
-            db["stats"]["last_error"] = str(
-                exc
-            )
-
-            log.exception(
-                "Worker error %s -> %s",
-                sid,
-                did,
-            )
-
-            await asyncio.sleep(3)
-
-
-# ============================================================
-# WORKER MANAGEMENT
-# ============================================================
-
-
-async def start_worker(
-    sid: str,
-    did: str,
-) -> None:
-
-    key = route_key(
-        sid,
-        did,
-    )
-
-    task = worker_tasks.get(
-        key
-    )
-
-    if task and not task.done():
-        return
-
-    worker_events[key] = asyncio.Event()
-
-    worker_tasks[key] = asyncio.create_task(
-        repeat_worker(
-            sid,
-            did,
-        ),
-        name=f"worker-{sid}-{did}",
-    )
-
-
-async def stop_worker(
-    sid: str,
-    did: str,
-) -> None:
-
-    key = route_key(
-        sid,
-        did,
-    )
-
-    task = worker_tasks.pop(
-        key,
-        None,
-    )
-
-    if task:
-
-        task.cancel()
-
-        try:
-            await task
-
-        except asyncio.CancelledError:
-            pass
-
-        except Exception:
-            log.exception(
-                "Worker shutdown error"
-            )
-
-    worker_events.pop(
-        key,
-        None,
-    )
-
-
-async def ensure_workers() -> None:
-
-    wanted: set[str] = set()
-
-    if db["settings"]["enabled"]:
-
-        for sid, route in db[
-            "routes"
-        ].items():
-
-            if not isinstance(
-                route,
-                dict,
-            ):
-                continue
-
-            for destination in route.get(
-                "destinations",
-                [],
-            ):
-
-                if not isinstance(
-                    destination,
-                    dict,
-                ):
-                    continue
-
-                did = destination.get(
-                    "id"
-                )
-
-                if did is None:
-                    continue
-
-                did = str(did)
-
-                key = route_key(
-                    str(sid),
-                    did,
-                )
-
-                wanted.add(key)
-
-                await start_worker(
-                    str(sid),
-                    did,
-                )
-
-    for key in list(
-        worker_tasks
-    ):
-
-        if key not in wanted:
-
-            sid, did = split_key(
-                key
-            )
-
-            await stop_worker(
-                sid,
-                did,
-            )
-
-
-# ============================================================
-# ALBUM FLUSH
-# ============================================================
-
-
-async def flush_album(
-    sid: str,
-    album_id: str,
-) -> None:
-
-    key = (
-        sid,
-        album_id,
-    )
-
-    try:
-
-        wait = float(
-            db["settings"].get(
-                "album_wait",
-                1.5,
-            )
-        )
-
-        await asyncio.sleep(
-            wait
-        )
-
-        mids = album_buffer.pop(
-            key,
-            [],
-        )
-
-        mids = sorted(
-            set(
-                int(x)
-                for x in mids
-            )
-        )
-
-        if not mids:
-            return
-
-        db["stats"]["albums"] += 1
-
-        await add_playlist_item(
-            sid,
-            mids,
-            album=True,
-        )
-
-        db["stats"]["received"] += len(
-            mids
-        )
-
-        db["stats"]["last_received"] = int(
-            time.time()
-        )
-
-        wake_workers_for_source(
-            sid
-        )
-
-        await save_db()
-
-    except asyncio.CancelledError:
-        raise
-
-    except Exception as exc:
-
-        db["stats"]["last_error"] = str(
-            exc
-        )
-
-        log.exception(
-            "Album flush error"
-        )
-
-    finally:
-
-        album_tasks.pop(
-            key,
-            None,
-        )
-
-
-# ============================================================
-# NEW CHANNEL POSTS
-# ============================================================
-
-
-@router.channel_post()
-async def channel_post(
-    message: Message,
-) -> None:
-
-    sid = str(
-        message.chat.id
-    )
-
-    mid = int(
-        message.message_id
-    )
-
-    log.info(
-        "NEW POST | source=%s | message=%s | type=%s",
-        sid,
-        mid,
-        message.content_type,
-    )
-
-    # Only configured sources.
-    if sid not in source_ids():
-        return
-
-    # --------------------------------------------------------
-    # ALBUM
-    # --------------------------------------------------------
-
-    album_id = message.media_group_id
-
-    if album_id:
-
-        key = (
-            sid,
-            str(album_id),
-        )
-
-        album_buffer.setdefault(
-            key,
-            [],
-        ).append(mid)
-
-        old_task = album_tasks.get(
-            key
-        )
-
-        if old_task:
-
-            old_task.cancel()
-
-        album_tasks[key] = asyncio.create_task(
-            flush_album(
-                sid,
-                str(album_id),
-            )
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # NORMAL POST
-    # --------------------------------------------------------
-
-    await add_playlist_item(
-        sid,
-        [mid],
-        album=False,
-    )
-
-    db["stats"]["received"] += 1
-
-    db["stats"]["last_received"] = int(
-        time.time()
-    )
-
-    await save_db()
-
-    # Wake repeat workers.
-    wake_workers_for_source(
-        sid
-    )
-
-
-# ============================================================
-# START
-# ============================================================
-
-
-@router.message(CommandStart())
-async def start_cmd(
-    message: Message,
-    state: FSMContext,
-) -> None:
-
-    await state.clear()
-
-    if not is_admin(message):
-
-        await message.answer(
-            "Only admin can access this bot."
-        )
-
-        return
-
-    await message.answer(
-        home_text(),
-        reply_markup=home_kb(),
-    )
-
-
-# ============================================================
-# ADMIN
-# ============================================================
-
-
-@router.message(Command("admin"))
-async def admin_cmd(
-    message: Message,
-    state: FSMContext,
-) -> None:
-
-    await state.clear()
-
-    if not is_admin(message):
-
-        await message.answer(
-            "Only admin can access this bot."
-        )
-
-        return
-
-    await message.answer(
-        home_text(),
-        reply_markup=home_kb(),
-    )
-
-
-# ============================================================
-# CANCEL
-# ============================================================
-
-
-@router.message(Command("cancel"))
-async def cancel_cmd(
-    message: Message,
-    state: FSMContext,
-) -> None:
-
-    await state.clear()
-
-    if is_admin(message):
-
-        await message.answer(
-            "❌ Cancelled.",
-            reply_markup=home_kb(),
-        )
-
-
-# ============================================================
-# CALLBACKS
+# CALLBACK HANDLER
 # ============================================================
 
 
@@ -2205,7 +2966,6 @@ async def callbacks(
     if not q.message:
 
         await q.answer()
-
         return
 
     data = q.data or ""
@@ -2217,7 +2977,6 @@ async def callbacks(
     if data == "home":
 
         await state.clear()
-
         await q.answer()
 
         await q.message.edit_text(
@@ -2233,18 +2992,30 @@ async def callbacks(
 
     if data == "toggle":
 
-        db["settings"]["enabled"] = not bool(
-            db["settings"]["enabled"]
+        db["settings"][
+            "enabled"
+        ] = not bool(
+            db["settings"].get(
+                "enabled",
+                True,
+            )
         )
 
         await save_db()
 
         await ensure_workers()
 
+        if db["settings"][
+            "enabled"
+        ]:
+            wake_all_workers()
+
         await q.answer(
-            "Started."
-            if db["settings"]["enabled"]
-            else "Stopped."
+            (
+                "▶️ Bot started."
+                if db["settings"]["enabled"]
+                else "⏹ Bot stopped."
+            )
         )
 
         await q.message.edit_text(
@@ -2255,30 +3026,32 @@ async def callbacks(
         return
 
     # --------------------------------------------------------
-    # REPEAT ON / OFF
+    # REPEAT
     # --------------------------------------------------------
 
     if data == "repeat":
 
-        db["settings"]["repeat_enabled"] = not bool(
-            db["settings"]["repeat_enabled"]
+        db["settings"][
+            "repeat_enabled"
+        ] = not bool(
+            db["settings"].get(
+                "repeat_enabled",
+                True,
+            )
         )
 
         await save_db()
 
-        if db["settings"]["repeat_enabled"]:
-
-            for event in worker_events.values():
-                event.set()
-
-            text = "🔁 Repeat mode ON."
-
-        else:
-
-            text = "⏸ Repeat mode OFF."
+        wake_all_workers()
 
         await q.answer(
-            text
+            (
+                "🔁 Repeat mode ON."
+                if db["settings"][
+                    "repeat_enabled"
+                ]
+                else "⏸ Repeat mode OFF."
+            )
         )
 
         await q.message.edit_text(
@@ -2354,10 +3127,12 @@ async def callbacks(
         return
 
     # --------------------------------------------------------
-    # SELECT SOURCE
+    # SOURCE SELECT
     # --------------------------------------------------------
 
-    if data.startswith("route:"):
+    if data.startswith(
+        "route:"
+    ):
 
         try:
 
@@ -2368,9 +3143,9 @@ async def callbacks(
                 )[1]
             )
 
-            source = db["sources"][
-                index
-            ]
+            source = db[
+                "sources"
+            ][index]
 
         except (
             ValueError,
@@ -2393,17 +3168,16 @@ async def callbacks(
         await q.message.edit_text(
             (
                 "🔀 <b>Route Configuration</b>\n\n"
-
                 f"Source: <b>{name_of(source)}</b>\n"
-                f"<code>{sid}</code>\n\n"
-
-                f"Playlist: "
+                f"ID: <code>{sid}</code>\n\n"
+                f"📚 Playlist: "
                 f"<b>{playlist_length(sid)}</b>\n"
-
-                f"Destinations: "
+                f"📤 Destinations: "
                 f"<b>{len(route_dest_ids(sid))}</b>"
             ),
-            reply_markup=route_kb(sid),
+            reply_markup=route_kb(
+                sid
+            ),
         )
 
         return
@@ -2412,7 +3186,9 @@ async def callbacks(
     # ROUTE BY ID
     # --------------------------------------------------------
 
-    if data.startswith("route_by_id:"):
+    if data.startswith(
+        "route_by_id:"
+    ):
 
         sid = data.split(
             ":",
@@ -2423,7 +3199,7 @@ async def callbacks(
             sid
         )
 
-        if not source:
+        if source is None:
 
             await q.answer(
                 "Source not found.",
@@ -2438,9 +3214,14 @@ async def callbacks(
             (
                 "🔀 <b>Route Configuration</b>\n\n"
                 f"Source: <b>{name_of(source)}</b>\n"
-                f"Playlist: <b>{playlist_length(sid)}</b>"
+                f"📚 Playlist: "
+                f"<b>{playlist_length(sid)}</b>\n"
+                f"📤 Destinations: "
+                f"<b>{len(route_dest_ids(sid))}</b>"
             ),
-            reply_markup=route_kb(sid),
+            reply_markup=route_kb(
+                sid
+            ),
         )
 
         return
@@ -2455,16 +3236,20 @@ async def callbacks(
 
         try:
 
-            _, sid, index = data.split(
-                ":",
-                2,
+            _, sid, index_raw = (
+                data.split(
+                    ":",
+                    2,
+                )
+            )
+
+            index = int(
+                index_raw
             )
 
             destination = db[
                 "destinations"
-            ][
-                int(index)
-            ]
+            ][index]
 
         except (
             ValueError,
@@ -2503,29 +3288,39 @@ async def callbacks(
             },
         )
 
-        current = {
-            str(x["id"])
-            for x in route.get(
+        current_ids = {
+            str(item["id"])
+            for item in route.get(
                 "destinations",
-                []
+                [],
             )
             if isinstance(
-                x,
+                item,
                 dict,
             )
+            and item.get("id")
+            is not None
         }
 
-        if did in current:
+        if did in current_ids:
 
-            route["destinations"] = [
-                x
-                for x in route[
+            route[
+                "destinations"
+            ] = [
+                item
+                for item in route[
                     "destinations"
                 ]
                 if str(
-                    x["id"]
+                    item["id"]
                 ) != did
             ]
+
+            # Stop ONLY this route.
+            await stop_worker(
+                sid,
+                did,
+            )
 
             result = "removed"
 
@@ -2542,6 +3337,12 @@ async def callbacks(
         await save_db()
 
         await ensure_workers()
+
+        if result == "added":
+            wake_route(
+                sid,
+                did,
+            )
 
         await q.answer(
             f"{name_of(destination)} {result}"
@@ -2568,7 +3369,9 @@ async def callbacks(
             "",
         ]
 
-        if not db["destinations"]:
+        if not db[
+            "destinations"
+        ]:
 
             lines.append(
                 "No destinations configured."
@@ -2584,17 +3387,21 @@ async def callbacks(
             )
 
             used = sum(
-                did in route_dest_ids(
+                1
+                for source in db[
+                    "sources"
+                ]
+                if did
+                in route_dest_ids(
                     str(source["id"])
                 )
-                for source in db["sources"]
             )
 
             lines.extend(
                 [
                     f"{index}. <b>{name_of(destination)}</b>",
                     f"Used by: <b>{used}</b> route(s)",
-                    f"<code>{did}</code>",
+                    f"ID: <code>{did}</code>",
                     "",
                 ]
             )
@@ -2624,7 +3431,7 @@ async def callbacks(
                 "Send @username or numeric channel ID.\n\n"
                 "<code>@channelusername</code>\n"
                 "<code>-1001234567890</code>\n\n"
-                "⚠️ Bot must be administrator."
+                "⚠️ Bot must be administrator in the source."
             )
         )
 
@@ -2650,14 +3457,14 @@ async def callbacks(
             (
                 "📤 <b>Add Destination</b>\n\n"
                 "Send @username or numeric channel/group ID.\n\n"
-                "⚠️ Bot must be administrator."
+                "⚠️ Bot must be administrator in destination."
             )
         )
 
         return
 
     # --------------------------------------------------------
-    # ADD DESTINATION TO ROUTE
+    # ADD DESTINATION FOR ROUTE
     # --------------------------------------------------------
 
     if data.startswith(
@@ -2691,7 +3498,8 @@ async def callbacks(
         await q.message.edit_text(
             (
                 "📤 <b>Add Destination to Route</b>\n\n"
-                "Send @username or numeric channel/group ID."
+                "Send @username or numeric channel/group ID.\n\n"
+                "⚠️ Bot must be administrator."
             )
         )
 
@@ -2710,47 +3518,67 @@ async def callbacks(
             1,
         )[1]
 
-        if sid in source_ids():
+        if sid not in source_ids():
 
-            db["sources"] = [
-                x
-                for x in db["sources"]
-                if str(
-                    x["id"]
-                ) != sid
-            ]
-
-            db["routes"].pop(
-                sid,
-                None,
+            await q.answer(
+                "Source not found.",
+                show_alert=True,
             )
 
-            db["playlists"].pop(
-                sid,
-                None,
+            return
+
+        # Stop all workers of this source.
+        for key in list(
+            worker_tasks
+        ):
+
+            rsid, rdid = (
+                split_route_key(key)
             )
 
-            db["positions"].pop(
-                sid,
-                None,
-            )
+            if rsid == sid:
 
-            for key in list(
-                worker_tasks
-            ):
-
-                rsid, did = split_key(
-                    key
+                await stop_worker(
+                    rsid,
+                    rdid,
                 )
 
-                if rsid == sid:
+        db["sources"] = [
+            source
+            for source in db[
+                "sources"
+            ]
+            if str(
+                source["id"]
+            ) != sid
+        ]
 
-                    await stop_worker(
-                        rsid,
-                        did,
-                    )
+        db["routes"].pop(
+            sid,
+            None,
+        )
 
-            await save_db()
+        db["playlists"].pop(
+            sid,
+            None,
+        )
+
+        # Remove route positions.
+        for key in list(
+            db["positions"]
+        ):
+
+            rsid, _ = (
+                split_route_key(key)
+            )
+
+            if rsid == sid:
+                db["positions"].pop(
+                    key,
+                    None,
+                )
+
+        await save_db()
 
         await q.answer(
             "Source removed."
@@ -2782,9 +3610,7 @@ async def callbacks(
 
             destination = db[
                 "destinations"
-            ].pop(
-                index
-            )
+            ][index]
 
         except (
             ValueError,
@@ -2802,6 +3628,23 @@ async def callbacks(
             destination["id"]
         )
 
+        # Stop route workers using it.
+        for key in list(
+            worker_tasks
+        ):
+
+            sid, route_did = (
+                split_route_key(key)
+            )
+
+            if route_did == did:
+
+                await stop_worker(
+                    sid,
+                    route_did,
+                )
+
+        # Remove from all routes.
         for route in db[
             "routes"
         ].values():
@@ -2812,30 +3655,43 @@ async def callbacks(
             ):
                 continue
 
-            route["destinations"] = [
-                x
-                for x in route.get(
+            route[
+                "destinations"
+            ] = [
+                item
+                for item in route.get(
                     "destinations",
                     [],
                 )
                 if str(
-                    x["id"]
+                    item.get("id")
                 ) != did
             ]
 
+        db["destinations"] = [
+            item
+            for item in db[
+                "destinations"
+            ]
+            if str(
+                item["id"]
+            ) != did
+        ]
+
+        # Remove positions.
         for key in list(
-            worker_tasks
+            db["positions"]
         ):
 
-            sid, route_did = split_key(
-                key
+            _, route_did = (
+                split_route_key(key)
             )
 
             if route_did == did:
 
-                await stop_worker(
-                    sid,
-                    route_did,
+                db["positions"].pop(
+                    key,
+                    None,
                 )
 
         await save_db()
@@ -2881,13 +3737,6 @@ async def callbacks(
                 source["id"]
             )
 
-            position = int(
-                db["positions"].get(
-                    sid,
-                    0,
-                )
-            )
-
             length = playlist_length(
                 sid
             )
@@ -2900,20 +3749,48 @@ async def callbacks(
                 f"   Items: <b>{length}</b>"
             )
 
-            if length:
+            # Show positions for every route.
+            for destination in route_dests(
+                sid
+            ):
+
+                did = str(
+                    destination["id"]
+                )
+
+                key = route_key(
+                    sid,
+                    did,
+                )
+
+                position = int(
+                    db["positions"].get(
+                        key,
+                        0,
+                    )
+                )
+
+                next_number = (
+                    position + 1
+                    if length
+                    else 0
+                )
+
+                if next_number > length:
+                    next_number = 1
 
                 lines.append(
-                    f"   Next position: "
-                    f"<b>{position + 1}</b>"
+                    f"   → {name_of(destination)}: "
+                    f"<b>next #{next_number}</b>"
                 )
 
             lines.append("")
 
         rows = []
 
-        for index, source in enumerate(
-            db["sources"]
-        ):
+        for source in db[
+            "sources"
+        ]:
 
             rows.append(
                 [
@@ -2965,7 +3842,7 @@ async def callbacks(
             sid
         )
 
-        if not source:
+        if source is None:
 
             await q.answer(
                 "Source not found.",
@@ -2978,31 +3855,16 @@ async def callbacks(
             sid
         )
 
-        position = int(
-            db["positions"].get(
-                sid,
-                0,
-            )
-        )
-
-        await q.answer()
-
         text = (
             "📚 <b>Playlist</b>\n\n"
             f"Source: <b>{name_of(source)}</b>\n"
-            f"Items: <b>{len(playlist)}</b>\n"
-            f"Current next position: "
-            f"<b>{position + 1 if playlist else 0}</b>\n\n"
+            f"Items: <b>{len(playlist)}</b>\n\n"
         )
 
         if playlist:
 
-            preview = playlist[
-                :20
-            ]
-
             for index, item in enumerate(
-                preview,
+                playlist[:30],
                 1,
             ):
 
@@ -3011,32 +3873,45 @@ async def callbacks(
                     [],
                 )
 
+                if not isinstance(
+                    ids,
+                    list,
+                ):
+                    ids = []
+
                 text += (
-                    f"{index}. "
-                    f"Message {ids[0] if ids else '?'}"
+                    f"{index}. Message "
+                    f"<code>"
+                    f"{ids[0] if ids else '?'}"
+                    f"</code>"
                 )
 
                 if len(ids) > 1:
+
                     text += (
-                        f" + {len(ids)-1} album items"
+                        f" "
+                        f"(album: {len(ids)} items)"
                     )
 
                 text += "\n"
 
-            if len(playlist) > 20:
+            if len(playlist) > 30:
 
                 text += (
-                    f"\n... +"
-                    f"{len(playlist)-20}"
+                    f"\n... and "
+                    f"{len(playlist) - 30}"
                     f" more"
                 )
 
         else:
 
             text += (
-                "Playlist empty.\n"
-                "New channel posts will be added automatically."
+                "Playlist is empty.\n\n"
+                "New posts from this source will "
+                "automatically be added."
             )
+
+        await q.answer()
 
         await q.message.edit_text(
             text,
@@ -3048,7 +3923,7 @@ async def callbacks(
         return
 
     # --------------------------------------------------------
-    # RESET PLAYLIST
+    # RESET PLAYLIST POSITION
     # --------------------------------------------------------
 
     if data.startswith(
@@ -3060,24 +3935,39 @@ async def callbacks(
             1,
         )[1]
 
-        db["positions"][sid] = 0
+        if sid not in source_ids():
+
+            await q.answer(
+                "Source not found.",
+                show_alert=True,
+            )
+
+            return
+
+        # Reset every destination independently.
+        for destination in route_dests(
+            sid
+        ):
+
+            did = str(
+                destination["id"]
+            )
+
+            db["positions"][
+                route_key(
+                    sid,
+                    did,
+                )
+            ] = 0
 
         await save_db()
 
-        event = get_worker_event(
-            route_key(
-                sid,
-                str(
-                    route_dests(sid)[0]["id"]
-                )
-            )
-        ) if route_dests(sid) else None
-
-        if event:
-            event.set()
+        wake_source(
+            sid
+        )
 
         await q.answer(
-            "Playlist position reset."
+            "⏮ All route positions reset to First."
         )
 
         return
@@ -3095,17 +3985,40 @@ async def callbacks(
             1,
         )[1]
 
+        if sid not in source_ids():
+
+            await q.answer(
+                "Source not found.",
+                show_alert=True,
+            )
+
+            return
+
         db["playlists"].pop(
             sid,
             None
         )
 
-        db["positions"][sid] = 0
+        # Reset all route positions.
+        for destination in route_dests(
+            sid
+        ):
+
+            did = str(
+                destination["id"]
+            )
+
+            db["positions"][
+                route_key(
+                    sid,
+                    did,
+                )
+            ] = 0
 
         await save_db()
 
         await q.answer(
-            "Playlist cleared."
+            "🗑 Playlist cleared."
         )
 
         return
@@ -3133,65 +4046,66 @@ async def callbacks(
 
         await q.answer()
 
-        st = db["stats"]
+        stats = db[
+            "stats"
+        ]
 
-        queues = []
+        workers = []
 
-        for key, task in worker_tasks.items():
+        for key, task in list(
+            worker_tasks.items()
+        ):
 
-            sid, did = split_key(
-                key
+            sid, did = (
+                split_route_key(key)
             )
 
-            state_value = (
-                "RUNNING"
+            source = get_source(
+                sid
+            )
+
+            destination = (
+                get_destination(did)
+            )
+
+            status = (
+                "🟢 RUNNING"
                 if not task.done()
-                else "STOPPED"
+                else "🔴 STOPPED"
             )
 
-            queues.append(
+            workers.append(
                 (
-                    f"• {name_of(get_source(sid))}"
+                    f"• {name_of(source)}"
                     f" → "
-                    f"{name_of(get_destination(did))}"
-                    f": <b>{state_value}</b>"
+                    f"{name_of(destination)}"
+                    f": {status}"
                 )
             )
 
         text = (
-            "📊 <b>Status</b>\n\n"
-
-            f"Running: "
-            f"<b>{db['settings']['enabled']}</b>\n"
-
-            f"Repeat: "
-            f"<b>{db['settings']['repeat_enabled']}</b>\n\n"
-
+            "📊 <b>Bot Status</b>\n\n"
+            f"Running: <b>"
+            f"{db['settings']['enabled']}"
+            f"</b>\n"
+            f"Repeat: <b>"
+            f"{db['settings']['repeat_enabled']}"
+            f"</b>\n\n"
             f"Workers: <b>{len(worker_tasks)}</b>\n"
-
-            f"📥 Received: "
-            f"<b>{st['received']}</b>\n"
-
-            f"📤 Sent: "
-            f"<b>{st['sent']}</b>\n"
-
-            f"❌ Failed: "
-            f"<b>{st['failed']}</b>\n"
-
-            f"🔄 Cycles: "
-            f"<b>{st['cycles']}</b>\n\n"
-
+            f"📥 Received: <b>{stats['received']}</b>\n"
+            f"📤 Sent: <b>{stats['sent']}</b>\n"
+            f"❌ Failed: <b>{stats['failed']}</b>\n"
+            f"🔄 Cycles: <b>{stats['cycles']}</b>\n\n"
             "<b>Workers</b>\n"
             + (
-                "\n".join(queues)
-                if queues
+                "\n".join(workers)
+                if workers
                 else "-"
             )
             + "\n\n"
-
             "<b>Last error</b>\n"
             f"<code>"
-            f"{str(st['last_error'] or '-')[:1500]}"
+            f"{str(stats['last_error'] or '-')[:1500]}"
             f"</code>"
         )
 
@@ -3224,57 +4138,78 @@ async def callbacks(
             1,
         )[1]
 
-        mapping = {
-
-            "interval": (
-                SetInterval.value,
-                (
-                    "⏱ <b>Interval</b>\n\n"
-                    "Enter seconds.\n"
-                    "Example: <code>30</code>"
-                ),
-            ),
-
-            "album": (
-                SetAlbumWait.value,
-                (
-                    "📦 <b>Album Wait</b>\n\n"
-                    "Enter seconds.\n"
-                    "Example: <code>1.5</code>"
-                ),
-            ),
-
-            "retries": (
-                SetRetries.value,
-                (
-                    "🔁 <b>Retries</b>\n\n"
-                    "Enter integer 0–20."
-                ),
-            ),
-
-            "playlist": (
-                SetPlaylistLimit.value,
-                (
-                    "📚 <b>Max Playlist</b>\n\n"
-                    "Enter 100–50000."
-                ),
-            ),
-        }
-
-        if kind in mapping:
+        if kind == "interval":
 
             await q.answer()
 
-            state_value, text = mapping[
-                kind
-            ]
-
             await state.set_state(
-                state_value
+                SetInterval.value
             )
 
             await q.message.edit_text(
-                text
+                (
+                    "⏱ <b>Interval</b>\n\n"
+                    "Enter seconds.\n\n"
+                    "Example:\n"
+                    "<code>30</code>\n\n"
+                    "Minimum: 0.1\n"
+                    "Maximum: 3600"
+                )
+            )
+
+            return
+
+        if kind == "album":
+
+            await q.answer()
+
+            await state.set_state(
+                SetAlbumWait.value
+            )
+
+            await q.message.edit_text(
+                (
+                    "📦 <b>Album Wait</b>\n\n"
+                    "Enter seconds.\n\n"
+                    "Example:\n"
+                    "<code>1.5</code>\n\n"
+                    "Minimum: 0.2\n"
+                    "Maximum: 10"
+                )
+            )
+
+            return
+
+        if kind == "retries":
+
+            await q.answer()
+
+            await state.set_state(
+                SetRetries.value
+            )
+
+            await q.message.edit_text(
+                (
+                    "🔁 <b>Retries</b>\n\n"
+                    "Enter an integer from 0 to 20."
+                )
+            )
+
+            return
+
+        if kind == "playlist":
+
+            await q.answer()
+
+            await state.set_state(
+                SetPlaylistLimit.value
+            )
+
+            await q.message.edit_text(
+                (
+                    "📚 <b>Max Playlist</b>\n\n"
+                    "Enter a number from 100 to 50000."
+                )
             )
 
             return
@@ -3283,7 +4218,7 @@ async def callbacks(
 
 
 # ============================================================
-# ADD SOURCE MESSAGE
+# ADD SOURCE
 # ============================================================
 
 
@@ -3298,10 +4233,14 @@ async def add_source(
     if not is_admin(message):
         return
 
+    value = (
+        message.text or ""
+    ).strip()
+
     try:
 
         source = await resolve_source(
-            (message.text or "").strip()
+            value
         )
 
         sid = str(
@@ -3315,53 +4254,47 @@ async def add_source(
                 reply_markup=sources_kb(),
             )
 
-        else:
+            return
 
-            db["sources"].append(
-                source
-            )
+        db["sources"].append(
+            source
+        )
 
-            db["routes"][sid] = {
-                "source": source,
-                "destinations": [],
-            }
+        db["routes"][sid] = {
+            "source": source,
+            "destinations": [],
+        }
 
-            db["playlists"].setdefault(
-                sid,
-                [],
-            )
+        db["playlists"].setdefault(
+            sid,
+            [],
+        )
 
-            db["positions"].setdefault(
-                sid,
-                0,
-            )
+        await save_db()
 
-            await save_db()
-
-            await message.answer(
-                (
-                    "✅ <b>Source Added</b>\n\n"
-                    f"<b>{name_of(source)}</b>\n"
-                    f"<code>{sid}</code>\n\n"
-                    "📡 New posts will be added to playlist.\n"
-                    "🔁 Playlist will repeat continuously.\n\n"
-                    "Now select destinations."
-                ),
-                reply_markup=route_kb(
-                    sid
-                ),
-            )
+        await message.answer(
+            (
+                "✅ <b>Source Added</b>\n\n"
+                f"Source: <b>{name_of(source)}</b>\n"
+                f"ID: <code>{sid}</code>\n\n"
+                "📡 New posts will be saved to its playlist.\n"
+                "🔁 Repeat mode will cycle the playlist."
+            ),
+            reply_markup=route_kb(
+                sid
+            ),
+        )
 
     except Exception as exc:
 
         log.exception(
-            "Add source failed"
+            "Add source failed."
         )
 
         await message.answer(
             (
                 "❌ <b>Could not add source</b>\n\n"
-                f"<code>{str(exc)[:1200]}</code>"
+                f"<code>{str(exc)[:1500]}</code>"
             )
         )
 
@@ -3371,7 +4304,7 @@ async def add_source(
 
 
 # ============================================================
-# ADD DESTINATION MESSAGE
+# ADD DESTINATION
 # ============================================================
 
 
@@ -3392,29 +4325,41 @@ async def add_destination(
         "route_source_id"
     )
 
+    value = (
+        message.text or ""
+    ).strip()
+
     try:
 
-        destination = await resolve_destination(
-            (message.text or "").strip()
+        destination = (
+            await resolve_destination(
+                value
+            )
         )
 
         did = str(
             destination["id"]
         )
 
-        if did not in destination_ids():
+        existing_destination = (
+            get_destination(did)
+        )
 
-            db["destinations"].append(
-                destination
+        if existing_destination:
+
+            destination = (
+                existing_destination
             )
 
         else:
 
-            destination = (
-                get_destination(did)
-                or destination
+            db[
+                "destinations"
+            ].append(
+                destination
             )
 
+        # Add directly to route if requested.
         if (
             route_sid
             and route_sid in source_ids()
@@ -3433,11 +4378,17 @@ async def add_destination(
             )
 
             existing = {
-                str(x["id"])
-                for x in route.get(
+                str(item["id"])
+                for item in route.get(
                     "destinations",
-                    []
+                    [],
                 )
+                if isinstance(
+                    item,
+                    dict,
+                )
+                and item.get("id")
+                is not None
             }
 
             if did not in existing:
@@ -3452,6 +4403,11 @@ async def add_destination(
 
             await ensure_workers()
 
+            wake_route(
+                route_sid,
+                did,
+            )
+
             await message.answer(
                 (
                     "✅ <b>Destination Added</b>\n\n"
@@ -3461,7 +4417,7 @@ async def add_destination(
                     f"Destination: <b>"
                     f"{name_of(destination)}"
                     f"</b>\n\n"
-                    "🚀 Route active."
+                    "🚀 Route worker started."
                 ),
                 reply_markup=route_kb(
                     route_sid
@@ -3476,7 +4432,8 @@ async def add_destination(
                 (
                     "✅ <b>Destination Added</b>\n\n"
                     f"<b>{name_of(destination)}</b>\n\n"
-                    "Open Routes and select source(s)."
+                    "Open Routes and select the source(s) "
+                    "where you want to use it."
                 ),
                 reply_markup=dest_kb(),
             )
@@ -3484,13 +4441,13 @@ async def add_destination(
     except Exception as exc:
 
         log.exception(
-            "Add destination failed"
+            "Add destination failed."
         )
 
         await message.answer(
             (
                 "❌ <b>Could not add destination</b>\n\n"
-                f"<code>{str(exc)[:1200]}</code>"
+                f"<code>{str(exc)[:1500]}</code>"
             )
         )
 
@@ -3515,7 +4472,10 @@ async def set_interval(
     try:
 
         value = float(
-            (message.text or "").strip()
+            (
+                message.text
+                or ""
+            ).strip()
         )
 
         if not 0.1 <= value <= 3600:
@@ -3527,11 +4487,13 @@ async def set_interval(
 
         await save_db()
 
-        for event in worker_events.values():
-            event.set()
+        wake_all_workers()
 
         await message.answer(
-            f"✅ Interval set to <b>{value}s</b>.",
+            (
+                f"✅ Interval set to "
+                f"<b>{value}s</b>."
+            ),
             reply_markup=settings_kb(),
         )
 
@@ -3562,7 +4524,10 @@ async def set_album_wait(
     try:
 
         value = float(
-            (message.text or "").strip()
+            (
+                message.text
+                or ""
+            ).strip()
         )
 
         if not 0.2 <= value <= 10:
@@ -3575,7 +4540,10 @@ async def set_album_wait(
         await save_db()
 
         await message.answer(
-            f"✅ Album wait: <b>{value}s</b>.",
+            (
+                f"✅ Album wait set to "
+                f"<b>{value}s</b>."
+            ),
             reply_markup=settings_kb(),
         )
 
@@ -3606,7 +4574,10 @@ async def set_retries(
     try:
 
         value = int(
-            (message.text or "").strip()
+            (
+                message.text
+                or ""
+            ).strip()
         )
 
         if not 0 <= value <= 20:
@@ -3650,7 +4621,10 @@ async def set_playlist_limit(
     try:
 
         value = int(
-            (message.text or "").strip()
+            (
+                message.text
+                or ""
+            ).strip()
         )
 
         if not 100 <= value <= 50000:
@@ -3660,7 +4634,61 @@ async def set_playlist_limit(
             "max_playlist"
         ] = value
 
+        # Trim existing playlists immediately.
+        for sid in list(
+            db["playlists"]
+        ):
+
+            playlist = db[
+                "playlists"
+            ].get(
+                sid,
+                [],
+            )
+
+            if len(playlist) <= value:
+                continue
+
+            remove_count = (
+                len(playlist)
+                - value
+            )
+
+            del playlist[
+                :remove_count
+            ]
+
+            for key in list(
+                db["positions"]
+            ):
+
+                route_sid, _ = (
+                    split_route_key(key)
+                )
+
+                if route_sid != str(sid):
+                    continue
+
+                try:
+                    position = int(
+                        db["positions"][
+                            key
+                        ]
+                    )
+                except Exception:
+                    position = 0
+
+                db["positions"][
+                    key
+                ] = max(
+                    0,
+                    position
+                    - remove_count,
+                )
+
         await save_db()
+
+        wake_all_workers()
 
         await message.answer(
             (
@@ -3690,55 +4718,54 @@ async def health(
     request: web.Request,
 ) -> web.Response:
 
-    total_playlist = sum(
-        len(get_playlist(str(source["id"])))
-        for source in db["sources"]
+    playlist_items = sum(
+        playlist_length(
+            str(source["id"])
+        )
+        for source in db[
+            "sources"
+        ]
     )
 
     return web.json_response(
         {
             "ok": True,
             "mode": "webhook",
-
             "running": bool(
-                db["settings"]["enabled"]
+                db["settings"].get(
+                    "enabled",
+                    True,
+                )
             ),
-
             "repeat": bool(
-                db["settings"]["repeat_enabled"]
+                db["settings"].get(
+                    "repeat_enabled",
+                    True,
+                )
             ),
-
             "sources": len(
                 db["sources"]
             ),
-
             "destinations": len(
                 db["destinations"]
             ),
-
             "workers": len(
                 worker_tasks
             ),
-
-            "playlist_items": total_playlist,
-
+            "playlist_items": playlist_items,
             "received": db[
                 "stats"
             ]["received"],
-
             "sent": db[
                 "stats"
             ]["sent"],
-
             "failed": db[
                 "stats"
             ]["failed"],
-
             "cycles": db[
                 "stats"
             ]["cycles"],
-
-            "time": int(
+            "timestamp": int(
                 time.time()
             ),
         }
@@ -3754,13 +4781,15 @@ async def webhook(
     request: web.Request,
 ) -> web.Response:
 
-    incoming = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token",
-        "",
+    incoming_secret = (
+        request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token",
+            "",
+        )
     )
 
     if not secrets.compare_digest(
-        incoming,
+        incoming_secret,
         WEBHOOK_SECRET,
     ):
 
@@ -3780,8 +4809,10 @@ async def webhook(
                 text="Empty update",
             )
 
-        update = Update.model_validate_json(
-            raw
+        update = (
+            Update.model_validate_json(
+                raw
+            )
         )
 
         if bot is None or dp is None:
@@ -3800,10 +4831,11 @@ async def webhook(
             text="OK"
         )
 
-    except Exception:
+    except Exception as exc:
 
         log.exception(
-            "Webhook update error"
+            "Webhook processing error: %s",
+            exc,
         )
 
         return web.Response(
@@ -3843,8 +4875,8 @@ async def start_server() -> None:
         webhook,
     )
 
-    server_runner = web.AppRunner(
-        app
+    server_runner = (
+        web.AppRunner(app)
     )
 
     await server_runner.setup()
@@ -3858,7 +4890,7 @@ async def start_server() -> None:
     await site.start()
 
     log.info(
-        "HTTP server started on port %s",
+        "HTTP SERVER READY | port=%s",
         PORT,
     )
 
@@ -3881,29 +4913,30 @@ async def setup_webhook() -> None:
     await bot.set_webhook(
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
-
         allowed_updates=[
             "message",
             "callback_query",
             "channel_post",
         ],
-
-        # Do not discard pending channel posts.
         drop_pending_updates=False,
     )
 
     info = await bot.get_webhook_info()
 
     log.info(
-        "Webhook=%s | pending=%s",
+        "WEBHOOK URL: %s",
         info.url,
+    )
+
+    log.info(
+        "WEBHOOK PENDING: %s",
         info.pending_update_count,
     )
 
     if info.last_error_message:
 
         log.error(
-            "Telegram webhook error: %s",
+            "TELEGRAM WEBHOOK ERROR: %s",
             info.last_error_message,
         )
 
@@ -3915,12 +4948,20 @@ async def setup_webhook() -> None:
 
 async def shutdown() -> None:
 
-    # Album tasks.
+    log.info(
+        "Starting shutdown..."
+    )
+
+    # --------------------------------------------------------
+    # Album tasks
+    # --------------------------------------------------------
+
     for task in list(
         album_tasks.values()
     ):
 
-        task.cancel()
+        if not task.done():
+            task.cancel()
 
     for task in list(
         album_tasks.values()
@@ -3934,22 +4975,25 @@ async def shutdown() -> None:
 
         except Exception:
             log.exception(
-                "Album task shutdown error"
+                "Album task shutdown error."
             )
 
     album_tasks.clear()
     album_buffer.clear()
 
-    # Workers.
+    # --------------------------------------------------------
+    # Workers
+    # --------------------------------------------------------
+
     for key in list(
         worker_tasks
     ):
 
-        try:
+        sid, did = (
+            split_route_key(key)
+        )
 
-            sid, did = split_key(
-                key
-            )
+        try:
 
             await stop_worker(
                 sid,
@@ -3959,35 +5003,48 @@ async def shutdown() -> None:
         except Exception:
 
             log.exception(
-                "Worker shutdown error: %s",
+                "Could not stop worker %s",
                 key,
             )
+
+    # --------------------------------------------------------
+    # Save final state
+    # --------------------------------------------------------
+
+    try:
+        await save_db()
+    except Exception:
+        log.exception(
+            "Final database save failed."
+        )
+
+    # --------------------------------------------------------
+    # HTTP
+    # --------------------------------------------------------
+
+    if server_runner:
+
+        try:
+            await server_runner.cleanup()
+        except Exception:
+            log.exception(
+                "HTTP server cleanup failed."
+            )
+
+    # --------------------------------------------------------
+    # Bot session
+    # --------------------------------------------------------
 
     if bot:
 
         try:
-
-            await bot.delete_webhook(
-                drop_pending_updates=False
-            )
-
-        except Exception:
-
-            log.exception(
-                "Could not delete webhook"
-            )
-
-        try:
-
             await bot.session.close()
-
         except Exception:
-
             pass
 
-    if server_runner:
-
-        await server_runner.cleanup()
+    log.info(
+        "Shutdown complete."
+    )
 
 
 # ============================================================
@@ -4000,6 +5057,10 @@ async def main() -> None:
     global bot
     global dp
 
+    # --------------------------------------------------------
+    # BOT
+    # --------------------------------------------------------
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(
@@ -4007,67 +5068,102 @@ async def main() -> None:
         ),
     )
 
+    # --------------------------------------------------------
+    # DISPATCHER
+    # --------------------------------------------------------
+
     dp = Dispatcher()
 
+    # IMPORTANT:
+    # Router is now correctly defined above.
     dp.include_router(
         router
     )
 
+    # --------------------------------------------------------
+    # BOT CHECK
+    # --------------------------------------------------------
+
     me = await bot.get_me()
 
     log.info(
-        "BOT CONNECTED @%s | id=%s",
+        "BOT CONNECTED | @%s | id=%s",
         me.username,
         me.id,
     )
 
-    # HTTP server first.
+    # --------------------------------------------------------
+    # HTTP SERVER
+    # --------------------------------------------------------
+
     await start_server()
 
-    # Telegram webhook.
+    # --------------------------------------------------------
+    # WEBHOOK
+    # --------------------------------------------------------
+
     await setup_webhook()
 
-    # Start all configured route workers.
+    # --------------------------------------------------------
+    # WORKERS
+    # --------------------------------------------------------
+
     await ensure_workers()
 
+    # --------------------------------------------------------
+    # READY
+    # --------------------------------------------------------
+
     log.info(
-        "================================================"
+        "=============================================="
     )
 
     log.info(
-        "READY"
+        "BOT READY"
     )
 
     log.info(
-        "Mode: WEBHOOK"
+        "MODE: WEBHOOK"
     )
 
     log.info(
-        "Repeat: %s",
-        db["settings"]["repeat_enabled"],
+        "REPEAT: %s",
+        db["settings"].get(
+            "repeat_enabled",
+            True,
+        ),
     )
 
     log.info(
-        "Sources: %s",
+        "RUNNING: %s",
+        db["settings"].get(
+            "enabled",
+            True,
+        ),
+    )
+
+    log.info(
+        "SOURCES: %s",
         len(db["sources"]),
     )
 
     log.info(
-        "Destinations: %s",
+        "DESTINATIONS: %s",
         len(db["destinations"]),
     )
 
     log.info(
-        "Workers: %s",
+        "WORKERS: %s",
         len(worker_tasks),
     )
 
     log.info(
-        "================================================"
+        "=============================================="
     )
 
     try:
 
+        # Keep Render Web Service alive.
         await asyncio.Event().wait()
 
     finally:
@@ -4076,7 +5172,7 @@ async def main() -> None:
 
 
 # ============================================================
-# ENTRY
+# ENTRY POINT
 # ============================================================
 
 
